@@ -1,0 +1,48 @@
+# Contextual Touch Bar layer: shown while the Omarchy display panel is open.
+# GENERATED INTO config.toml by tiny-dfr-workspace -- edit this file, not that.
+#
+# tiny-dfr has no slider widget (buttons only), so the 25/50/75/100 row is a
+# stepped stand-in, using omarchy-brightness-display's absolute N% form.
+
+MediaLayerDefault = true
+DoublePressSwitchLayers = 200
+EnablePixelShift = true
+ShowButtonOutlines = true
+AdaptiveBrightness = true
+
+MediaLayerKeys = [
+@WORKSPACES@
+
+    { Stretch = 1 },
+
+    { Icon = "brightness_low",  Action = "BrightnessDown" },
+    { Icon = "brightness_high", Action = "BrightnessUp"   },
+
+    { Stretch = 1 },
+
+    # Real slider: drag anywhere along it. tiny-dfr publishes the value to
+    # /run/tiny-dfr/slider.sock and tiny-dfr-slider.service applies it.
+    { Slider = "brightness", Stretch = 8 },
+
+    { Stretch = 1 },
+
+    # Icon, not Text: a "Night" label fills a 1-unit slot edge to edge with
+    # no padding, unlike every other button on the strip.
+    { Icon = "night", Action = [ "LeftMeta", "LeftCtrl", "N" ] },
+    { Time = "%a %H:%M", Action = "Time", Stretch = 3 }
+]
+
+PrimaryLayerKeys = [
+    { Text = "F1",  Action = "F1"  },
+    { Text = "F2",  Action = "F2"  },
+    { Text = "F3",  Action = "F3"  },
+    { Text = "F4",  Action = "F4"  },
+    { Text = "F5",  Action = "F5"  },
+    { Text = "F6",  Action = "F6"  },
+    { Text = "F7",  Action = "F7"  },
+    { Text = "F8",  Action = "F8"  },
+    { Text = "F9",  Action = "F9"  },
+    { Text = "F10", Action = "F10" },
+    { Text = "F11", Action = "F11" },
+    { Text = "F12", Action = "F12" }
+]

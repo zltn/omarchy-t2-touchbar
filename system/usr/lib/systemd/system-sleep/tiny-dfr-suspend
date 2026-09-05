@@ -1,0 +1,48 @@
+#!/bin/sh
+# Touch Bar across suspend -- MINIMAL variant.
+#
+# WHY THIS IS DELIBERATELY LESS CLEVER THAN THE LAST ONE
+#
+# The previous hook unloaded appletbdrm and then re-enumerated the Touch Bar's
+# USB device by writing bConfigurationValue 0 -> 2, right at the suspend
+# boundary. That device sits on t2bce_vhci -- the same CRAP-tainted staging
+# bridge the internal keyboard is on.
+#
+# On 2026-08-16 this machine hard-locked twice on resume within an hour. The
+# second crash's log ends at "PM: suspend entry (s2idle)": no suspend exit, no
+# post hook, nothing. Neither crash left a panic or a pstore record, so nothing
+# is proven -- but that hook was the one thing touching USB on that bridge
+# across suspend, and Omarchy removes tiny-dfr on T2 Macs specifically because
+# of suspend interactions with t2bce (migration 1785944594).
+#
+# So: stop the daemon before sleep, start it after, and touch NOTHING else.
+# No module unload. No USB re-enumeration.
+#
+# KNOWN TRADE-OFF: the Touch Bar may come back blank, because appletbdrm keeps
+# descriptors that no longer match after resume -- exactly the "stale device
+# descriptors" Omarchy cited. That is cosmetic and recoverable:
+#     sudo systemctl restart tiny-dfr
+# A blank strip is a fair price for a machine that resumes.
+#
+# Inspect with:  journalctl -b 0 -t tiny-dfr-suspend
+# Installed at /usr/lib/systemd/system-sleep/tiny-dfr-suspend
+# (must be /usr/lib, NOT /etc -- systemd 261 compiles in one hook dir)
+
+TAG=tiny-dfr-suspend
+LOG() { logger -t "$TAG" -- "$*"; }
+RUN() { out=$("$@" 2>&1); rc=$?; [ -n "$out" ] && LOG "$* -> $out"; return $rc; }
+
+case "$1" in
+  pre)
+    LOG "pre: stopping tiny-dfr (operation=$2)"
+    RUN systemctl stop tiny-dfr.service
+    LOG "pre: done (no module unload, no USB bounce)"
+    ;;
+  post)
+    LOG "post: starting tiny-dfr"
+    RUN systemctl start tiny-dfr.service
+    LOG "post: done"
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Regenerate the Touch Bar's active-workspace pills in the current theme colour.
+
+The pill is drawn with the same gradient Hyprland uses for the active window
+border (general:col.active_border), so the Touch Bar's "you are here" marker
+matches the window border's "this one is focused" marker.
+
+Run directly, or let it run itself: it is installed as an Omarchy theme-set
+hook, so the pills re-colour whenever the theme changes.
+
+  omarchy hook install theme-set ~/.local/bin/tiny-dfr-ws-icons
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+OUT_DIR = "/etc/tiny-dfr"
+CONF = "/etc/tiny-dfr/touchbar.conf"
+
+
+def _workspace_count(default=5):
+    """Must match the layout's workspace count, so read the same key."""
+    try:
+        with open(CONF) as f:
+            m = re.search(r"^\s*WORKSPACES\s*=\s*(\d+)\s*$", f.read(), re.M)
+    except Exception:
+        return default
+    if not m:
+        return default
+    n = int(m.group(1))
+    return n if 1 <= n <= 10 else default
+
+
+WORKSPACES = tuple(range(1, _workspace_count() + 1))
+FALLBACK = ("ffffff", "ffffff", 45)
+
+
+def active_border():
+    """Parse Hyprland's col.active_border -> (rgb1, rgb2, angle).
+
+    Hyprland reports colours as AARRGGBB and may report a gradient with any
+    number of stops plus an angle, e.g. 'ee26a269 ee2ec27e 45deg'.
+    """
+    try:
+        out = subprocess.run(
+            ["hyprctl", "getoption", "general:col.active_border"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception as e:
+        print(f"tiny-dfr-ws-icons: hyprctl failed ({e}), using white", file=sys.stderr)
+        return FALLBACK
+
+    stops = re.findall(r"\b([0-9a-fA-F]{8})\b", out)
+    if not stops:
+        return FALLBACK
+    angle_m = re.search(r"(\d+)deg", out)
+    angle = int(angle_m.group(1)) if angle_m else 0
+    # Drop the AA byte; SVG gets full opacity because the Touch Bar has no
+    # backdrop to blend with.
+    rgb = [s[2:] for s in stops]
+    return rgb[0], rgb[-1], angle
+
+
+def luminance(hexrgb):
+    """WCAG relative luminance, for picking a readable digit colour."""
+    def chan(v):
+        v = v / 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (int(hexrgb[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+
+
+def contrast(l1, l2):
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def main():
+    c1, c2, angle = active_border()
+
+    # Judge the digit against the mean of the two stops, so a steep gradient
+    # cannot leave one end of the pill unreadable.
+    mean = (luminance(c1) + luminance(c2)) / 2
+    on_black, on_white = contrast(mean, 0.0), contrast(mean, 1.0)
+    fg = "black" if on_black >= on_white else "white"
+
+    # Hyprland measures the gradient angle counter-clockwise from the +x axis;
+    # this only needs to look like the border, so map it onto the unit square.
+    import math
+    rad = math.radians(angle)
+    dx, dy = math.cos(rad), -math.sin(rad)
+    x1, y1 = 0.5 - dx / 2, 0.5 - dy / 2
+    x2, y2 = 0.5 + dx / 2, 0.5 + dy / 2
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for n in WORKSPACES:
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" '
+            'viewBox="0 0 48 48">'
+            f'<defs><linearGradient id="g" x1="{x1:.3f}" y1="{y1:.3f}" '
+            f'x2="{x2:.3f}" y2="{y2:.3f}">'
+            f'<stop offset="0" stop-color="#{c1}"/>'
+            f'<stop offset="1" stop-color="#{c2}"/>'
+            '</linearGradient></defs>'
+            '<rect x="3" y="7" width="42" height="34" rx="10" fill="url(#g)"/>'
+            f'<text x="24" y="33" font-family="sans-serif" font-size="26" '
+            f'font-weight="bold" fill="{fg}" text-anchor="middle">{n}</text>'
+            '</svg>'
+        )
+        path = os.path.join(OUT_DIR, f"ws{n}_active.svg")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(svg)
+        # Explicit, not left to the umask: tiny-dfr reads these as `nobody`, and
+        # a pill it cannot read is silently skipped rather than reported.
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+
+    print(f"tiny-dfr-ws-icons: #{c1} -> #{c2} @{angle}deg, {fg} digits")
+
+    # tiny-dfr caches icons at config load and only watches config.toml, so
+    # changing an SVG alone changes nothing on screen. Something has to rewrite
+    # the config to trigger the reload.
+    #
+    # Which "something" depends on who is driving the strip. Under omarchy-shell
+    # that is the t2.touchbar plugin, and asking it to redraw is enough. Without
+    # the shell it is tiny-dfr-workspace.service, which rewrites the config on
+    # restart. Try the plugin first and fall back, so this one hook works for
+    # both setups -- and so a theme change does not silently leave the pills in
+    # the previous theme's colour.
+    redrawn = False
+    try:
+        # Deliberately NOT `omarchy-shell -q`: quiet mode suppresses stdout and
+        # returns success even when the target does not exist, which makes it
+        # impossible to tell "the plugin redrew" from "there is no plugin" --
+        # and the fallback would then start the daemon on a machine already
+        # running the plugin, leaving two writers racing on config.toml.
+        r = subprocess.run(
+            ["omarchy-shell", "touchbar", "redraw"],
+            capture_output=True, text=True, timeout=5,
+        )
+        redrawn = r.returncode == 0 and "ok" in r.stdout
+    except Exception:
+        redrawn = False
+
+    if not redrawn:
+        subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", "tiny-dfr-workspace.service"],
+            check=False,
+        )
+
+
+if __name__ == "__main__":
+    main()

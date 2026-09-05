@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""Highlight the active Hyprland workspace on the Touch Bar.
+
+tiny-dfr has no concept of state: every button is drawn once from the config
+and never changes. But it *does* watch /etc/tiny-dfr/config.toml with inotify
+(IN_MOVED_TO | IN_CLOSE | IN_ONESHOT, see ConfigManager::arm_inotify) and, on
+an event, reloads the config and forces a complete redraw (main.rs:921).
+
+So the active workspace can be shown by regenerating the config whenever it
+changes. This daemon listens on Hyprland's event socket, renders
+config.template.toml with the active workspace swapped from a plain digit to a
+filled pill icon, and writes it atomically via os.replace() -- the rename is
+what fires IN_MOVED_TO.
+
+Deliberate details:
+  * writes only when the workspace actually changed, so an idle desktop
+    produces zero churn
+  * debounced, because holding a workspace key fires many events and each
+    rewrite costs tiny-dfr a full config parse + font reload
+  * reconnects when Hyprland restarts (the instance signature changes)
+"""
+
+import glob
+import os
+import re
+import select
+import socket
+import sys
+import time
+
+TEMPLATE = "/etc/tiny-dfr/config.template.toml"
+TARGET = "/etc/tiny-dfr/config.toml"
+BATTERY_SVG = "/etc/tiny-dfr/battery.svg"
+# Not hardcoded to BAT0: some MacBooks enumerate the cell as BAT1.
+_BATS = sorted(glob.glob("/sys/class/power_supply/BAT*"))
+BATTERY_DIR = _BATS[0] if _BATS else "/sys/class/power_supply/BAT0"
+CONF = "/etc/tiny-dfr/touchbar.conf"
+
+# 0664, not 0644, and this matters even though this daemon runs as root.
+#
+# Every write here is tmp-file + os.replace(), so the file is RECREATED each
+# time. /etc/tiny-dfr is setgid, so the new file inherits the directory's group,
+# but its mode comes from this chmod. At 0644 a single run of this daemon leaves
+# config.toml unwritable by that group -- which permanently locks out the
+# omarchy-shell plugin, since that runs as the user and writes in place. The
+# plugin then silently stops updating the strip.
+#
+# World-readable is also required either way: tiny-dfr itself runs as `nobody`.
+FILE_MODE = 0o664
+
+
+def _workspace_count(default=5):
+    """How many workspace buttons the strip carries.
+
+    Read from touchbar.conf so the same layout works on a machine with a
+    different number of workspaces; absent on most installs, in which case the
+    default stands. Kept in sync with the QML service, which reads the same key.
+    """
+    try:
+        with open(CONF) as f:
+            m = re.search(r"^\s*WORKSPACES\s*=\s*(\d+)\s*$", f.read(), re.M)
+    except Exception:
+        return default
+    if not m:
+        return default
+    n = int(m.group(1))
+    return n if 1 <= n <= 10 else default
+
+
+WORKSPACES = tuple(range(1, _workspace_count() + 1))
+
+# Bright enough to read at a glance on a black OLED strip at arm's length.
+BATT_GREEN = "#4ade80"
+BATT_AMBER = "#fbbf24"
+BATT_RED = "#f87171"
+
+BATTERY_POLL = 15.0
+
+# Update indicator. The bar widget hides itself entirely when nothing is
+# pending (SystemUpdate.qml: `visible: updateAvailable`); here the button stays
+# put and changes colour instead, because a button vanishing from the Touch Bar
+# reflows every other button next to it.
+UPDATE_SVG = "/etc/tiny-dfr/update.svg"
+UPDATE_STATE = "/etc/tiny-dfr/update.state"
+
+# Mic icon. The listener publishes the live mute state (event-driven off
+# pactl); this just swaps which glyph mic.svg holds, so the slash appears only
+# when the mic is genuinely muted rather than being a permanent label.
+MIC_STATE = "/run/tiny-dfr/mic.state"
+MIC_SVG = "/etc/tiny-dfr/mic.svg"
+MIC_SOURCES = {True: "/etc/tiny-dfr/mic_muted.svg",
+               False: "/etc/tiny-dfr/mic_on.svg"}
+# Reading a 2-byte file, so this can be tight. The rest of the mic latency is
+# the listener's wpctl query (~35ms) plus tiny-dfr's reload.
+MIC_POLL = 0.1
+
+# Every config rewrite makes tiny-dfr reload and force a COMPLETE redraw
+# (main.rs: needs_complete_redraw = true), which asks appletbdrm for one damage
+# rect covering the whole 2170x60 panel. The driver allocates that transfer
+# buffer with kvzalloc and hands it to usb_bulk_msg; at ~509KB it needs an
+# order-7 contiguous block, and when memory is fragmented kvzalloc falls back
+# to vmalloc, which the kernel refuses to DMA:
+#   "rejecting DMA map of vmalloc memory"  ->  Failed to send message (-11)
+# The frame is dropped. Partial redraws are small enough to never hit it.
+#
+# So icon-state changes are batched: several arriving together produce ONE
+# rewrite, and therefore one full-panel transfer instead of several.
+# Workspace switches are deliberately NOT routed through this -- they have
+# their own 30ms debounce and are the one path where latency is felt.
+STATE_COALESCE = 0.15
+
+# Nightlight icon: filled moon when warmed, outline when neutral. Same shape as
+# the mic -- the listener publishes state, this only chooses the glyph.
+NIGHT_STATE = "/run/tiny-dfr/night.state"
+NIGHT_SVG = "/etc/tiny-dfr/night.svg"
+NIGHT_SOURCES = {True: "/etc/tiny-dfr/night_on.svg",
+                 False: "/etc/tiny-dfr/night_off.svg"}
+
+# Contextual layers. The trigger declares the context (tiny-dfr-context writes
+# this file) because every Omarchy panel is the same Hyprland layer surface,
+# "omarchy-keyboard-panel", at identical geometry, and the shell does not
+# expose which one is open over IPC. closelayer DOES fire reliably, so exiting
+# the context is detected properly however the panel is dismissed.
+CONTEXT_STATE = "/etc/tiny-dfr/context.state"
+
+# A config reload replaces tiny-dfr's layer array mid-touch. Upstream's
+# TouchEvent::Up then resolved the button by the index captured at touch-down
+# and released the wrong one, stranding the real keys down -- that is what made
+# "a" and "d" stop typing. The patched binary records the pressed keys with the
+# touch and releases those, so this delay is no longer load-bearing.
+#
+# A short settle is still kept so the layout does not visibly swap out from
+# under a finger that is still on the button.
+CONTEXT_SETTLE = 0.15
+
+# Sentinel: None is a real context value (the default layer), so it cannot
+# double as "nothing pending".
+_UNSET = object()
+PANEL_NAMESPACE = "omarchy-keyboard-panel"
+CONTEXT_TEMPLATES = {
+    "audio": "/etc/tiny-dfr/context-audio.template.toml",
+    "display": "/etc/tiny-dfr/context-display.template.toml",
+}
+# Just a file read now, so poll often enough to follow the 30min timer.
+UPDATE_POLL = 60.0
+UPDATE_AMBER = "#fbbf24"
+# Material Symbols "autorenew" -- the two-arrow loop, matching the Nerd Font
+#  glyph the Omarchy bar uses for this widget.
+AUTORENEW_PATH = (
+    "M196-331q-20-36-28-72.5t-8-74.5q0-131 94.5-225.5T480-798h43l-80-80 39-39 "
+    "149 149-149 149-40-40 79-79h-41q-107 0-183.5 76.5T220-478q0 29 5.5 55t13.5 "
+    "49l-43 43ZM476-40 327-189l149-149 39 39-80 80h45q107 0 183.5-76.5T740-479q0"
+    "-29-5-55t-15-49l43-43q20 36 28.5 72.5T800-479q0 131-94.5 225.5T480-159h-45l"
+    "80 80-39 39Z"
+)
+
+# Just long enough to coalesce the burst Hyprland emits for one switch
+# (workspace + workspacev2 + focusedmon all fire together), short enough to be
+# imperceptible. This is added latency on every switch, so keep it small.
+DEBOUNCE = 0.03
+IDLE_POLL = 1.0
+
+
+def log(msg):
+    print(f"tiny-dfr-workspace: {msg}", file=sys.stderr, flush=True)
+
+
+def read_context():
+    """Which contextual layer to show, or None for the default layout."""
+    try:
+        with open(CONTEXT_STATE) as f:
+            v = f.read().strip()
+    except Exception:
+        return None
+    return v if v in CONTEXT_TEMPLATES else None
+
+
+def clear_context():
+    try:
+        tmp = CONTEXT_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n")
+        os.chmod(tmp, FILE_MODE)
+        os.replace(tmp, CONTEXT_STATE)
+    except Exception as e:
+        log(f"could not clear context: {e}")
+
+
+def render(active, context=None):
+    """Return the config text with `active` drawn as a pill icon."""
+    rows = []
+    for n in WORKSPACES:
+        action = f'[ "LeftMeta", "Num{n}" ]'
+        if n == active:
+            rows.append(f'    {{ Icon = "ws{n}_active", Action = {action} }},')
+        else:
+            rows.append(f'    {{ Text = "{n}", Action = {action} }},')
+    path = CONTEXT_TEMPLATES.get(context, TEMPLATE)
+    try:
+        with open(path) as f:
+            body = f.read()
+    except Exception as e:
+        log(f"context template {path} unreadable ({e}), falling back")
+        with open(TEMPLATE) as f:
+            body = f.read()
+    return body.replace("@WORKSPACES@", "\n".join(rows))
+
+
+def write_config(active, context=None):
+    """Atomically replace the config so tiny-dfr's IN_MOVED_TO watch fires.
+
+    No fsync: this file is regenerated on the next workspace switch anyway, so
+    durability buys nothing and the flush sat directly in the redraw path.
+    """
+    text = render(active, context)
+    tmp = TARGET + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, FILE_MODE)
+    os.replace(tmp, TARGET)
+
+
+def read_battery():
+    """(percent 0-100, charging) or None.
+
+    tiny-dfr's own Battery widget is not used here: it offers only
+    green-when-charging / red-under-10%, and its charge_now/charge_full has no
+    clamp, so a full charge on this cell reports 101% (charge_full has drifted
+    below the true capacity). Computing it here fixes both.
+    """
+    def val(name):
+        try:
+            with open(os.path.join(BATTERY_DIR, name)) as f:
+                return f.read().strip()
+        except Exception:
+            return None
+
+    status = val("status") or "Unknown"
+    now, full, cap = val("charge_now"), val("charge_full"), val("capacity")
+    pct = None
+    if now and full:
+        try:
+            f = float(full)
+            if f > 0:
+                pct = (float(now) / f) * 100.0
+        except ValueError:
+            pass
+    if pct is None and cap:
+        try:
+            pct = float(cap)
+        except ValueError:
+            pass
+    if pct is None:
+        return None
+    return max(0, min(100, round(pct))), status in ("Charging", "Full")
+
+
+def battery_colour(pct, charging):
+    """green >=20%, amber 5-19%, red <5%."""
+    if charging:
+        return BATT_GREEN
+    if pct < 5:
+        return BATT_RED
+    if pct < 20:
+        return BATT_AMBER
+    return BATT_GREEN
+
+
+def write_battery_icon(pct, charging):
+    """Draw a horizontal battery whose fill and colour both track the level.
+
+    The viewBox is 2:1 and the glyph fills it, because librsvg preserves aspect
+    ratio when rendering into tiny-dfr's icon rectangle: a square viewBox drawn
+    into a wide rect just letterboxes, wasting the width. The template pairs
+    this with IconWidth/IconHeight of the same 2:1 ratio.
+
+    Box height is 48, the same as every other icon, so the battery sits with
+    identical top/bottom padding in the 60px panel. Width is 72 rather than a
+    full 2:1, to keep a visible gap from the neighbouring icon.
+
+    The shell (outline + terminal) is white like every other icon on the strip;
+    only the fill level inside carries the colour. That way the battery reads
+    as part of the icon set, and the colour means one thing only: charge level.
+    """
+    colour = battery_colour(pct, charging)
+    track_x, track_y, track_h, track_max = 8.0, 11.5, 25.0, 46.0
+    fill_w = track_max * pct / 100.0
+
+    bolt = ""
+    if charging:
+        # Punched in the panel's black so it reads as a cutout at any fill level.
+        bolt = ('<path fill="#000000" d="M34 11 L24 25 L30 25 L27.5 37 '
+                'L38 22 L32 22 Z"/>')
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="72" height="48" '
+        'viewBox="0 0 72 48">'
+        '<rect x="3" y="6" width="56" height="36" rx="9" fill="none" '
+        'stroke="white" stroke-width="3.5"/>'
+        '<rect x="62" y="17" width="6" height="14" rx="2.5" fill="white"/>'
+        + (f'<rect x="{track_x}" y="{track_y}" width="{fill_w:.2f}" '
+           f'height="{track_h}" rx="4" fill="{colour}"/>' if fill_w > 1 else '')
+        + bolt +
+        '</svg>'
+    )
+    tmp = BATTERY_SVG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(svg)
+    os.chmod(tmp, FILE_MODE)
+    os.replace(tmp, BATTERY_SVG)
+
+
+def read_updates():
+    """True/False from the state file, or None if it is missing or malformed.
+
+    The check itself runs as the user on a systemd timer
+    (tiny-dfr-update-check), NOT here. omarchy-update-available calls
+    checkupdates, which does `pacman -Sy` against a temp db and needs the
+    network -- and this unit sets RestrictAddressFamilies=AF_UNIX, so the sync
+    failed silently inside the sandbox and the script honestly reported "up to
+    date". Reading a one-byte file keeps the sandbox intact, keeps pacman off
+    root, and costs nothing.
+    """
+    try:
+        with open(UPDATE_STATE) as f:
+            v = f.read().strip()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"update state unreadable: {e}")
+        return None
+    if v not in ("0", "1"):
+        log(f"update state malformed: {v!r}")
+        return None
+    return v == "1"
+
+
+def write_update_icon(available):
+    """White normally, amber when an update is pending."""
+    colour = UPDATE_AMBER if available else "white"
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" height="48" '
+        'viewBox="0 -960 960 960" width="48">'
+        f'<path fill="{colour}" d="{AUTORENEW_PATH}"/>'
+        '</svg>'
+    )
+    tmp = UPDATE_SVG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(svg)
+    os.chmod(tmp, FILE_MODE)
+    os.replace(tmp, UPDATE_SVG)
+
+
+def read_flag(path):
+    """True/False from a one-byte state file, None when absent or malformed."""
+    try:
+        with open(path) as f:
+            v = f.read().strip()
+    except Exception:
+        return None
+    return v == "1" if v in ("0", "1") else None
+
+
+def swap_icon(dest, sources, state):
+    """Point `dest` at one of two glyphs, atomically."""
+    src = sources.get(bool(state))
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, FILE_MODE)
+        os.replace(tmp, dest)
+    except Exception as e:
+        log(f"icon swap {dest} failed: {e}")
+
+
+def read_mic():
+    return read_flag(MIC_STATE)
+
+
+def write_mic_icon(muted):
+    swap_icon(MIC_SVG, MIC_SOURCES, muted)
+
+
+def battery_bucket(state):
+    """Change key: 5% steps, plus charging state, plus the colour.
+
+    The colour has to be part of this. Buckets alone would miss the amber->red
+    crossing at 5%, because 4% and 5% both round to the same bucket -- exactly
+    the transition that matters most.
+    """
+    if state is None:
+        return None
+    pct, charging = state
+    return (round(pct / 5) * 5, charging, battery_colour(pct, charging))
+
+
+def find_sockets():
+    """Hyprland's instance signature changes per session, so glob for it."""
+    out = []
+    for ev in glob.glob("/run/user/*/hypr/*/.socket2.sock"):
+        out.append((ev, ev.replace(".socket2.sock", ".socket.sock")))
+    return out
+
+
+def query_active(cmd_sock):
+    """Ask Hyprland for the current workspace; the event socket only reports changes."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(cmd_sock)
+        s.sendall(b"activeworkspace")
+        data = b""
+        while chunk := s.recv(4096):
+            data += chunk
+        s.close()
+        m = re.search(rb"workspace ID (-?\d+)", data)
+        if m:
+            return int(m.group(1))
+    except Exception as e:
+        log(f"could not query active workspace: {e}")
+    return None
+
+
+def main():
+    if not os.path.exists(TEMPLATE):
+        log(f"missing {TEMPLATE}, nothing to do")
+        return 1
+
+    current = None
+    pending = None
+    pending_at = 0.0
+    complained = False
+    batt = None
+    last_batt_check = 0.0
+    upd = None
+    last_upd_check = 0.0
+
+    # Draw the battery once up front so the icon exists before any config
+    # referencing it is loaded.
+    st = read_battery()
+    if st:
+        write_battery_icon(*st)
+        batt = battery_bucket(st)
+        log(f"battery {st[0]}%{' charging' if st[1] else ''}")
+
+    # context.state lives in /etc and therefore SURVIVES a reboot. A freshly
+    # started daemon cannot be inside an open panel, so a leftover value strands
+    # the Touch Bar on a contextual layer forever: the only thing that clears a
+    # context is a closelayer event, and no panel was ever opened to produce
+    # one. Seen for real after the first reboot -- the strip came up stuck on
+    # the audio layer with no panel on screen.
+    clear_context()
+    context = None
+    ctx_pending = _UNSET
+    ctx_pending_at = 0.0
+    state_dirty = False
+    state_dirty_at = 0.0
+    mic = read_mic()
+    if mic is not None:
+        write_mic_icon(mic)
+    last_mic_check = 0.0
+
+    night = read_flag(NIGHT_STATE)
+    if night is not None:
+        swap_icon(NIGHT_SVG, NIGHT_SOURCES, night)
+
+    upd = read_updates()
+    write_update_icon(bool(upd))
+    log(f"updates pending: {upd}")
+
+    log("started")
+    while True:
+        socks = find_sockets()
+        if not socks:
+            # Silence here once cost an hour: with ProtectHome=true the unit
+            # sandbox blanks /run/user, so this branch spun forever with no
+            # output and the service still reported "active".
+            if not complained:
+                log("no Hyprland event socket under /run/user/*/hypr/, waiting")
+                complained = True
+            time.sleep(2)
+            continue
+        complained = False
+        ev_path, cmd_path = socks[0]
+
+        initial = query_active(cmd_path)
+        if initial is not None and initial != current:
+            current = initial
+            write_config(current, context)
+            log(f"initial workspace {current}")
+
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(ev_path)
+            s.setblocking(False)
+            log(f"connected to {ev_path}")
+            buf = b""
+            while True:
+                # Block only until the debounce is actually due. A fixed
+                # recv timeout here used to add up to its full length to
+                # every switch, because the flush is only reachable between
+                # recv() calls.
+                # Battery is polled, not evented. Only redraw when the 5%
+                # bucket or the charging state actually changes.
+                now_t = time.monotonic()
+                if now_t - last_batt_check >= BATTERY_POLL:
+                    last_batt_check = now_t
+                    st = read_battery()
+                    if st and battery_bucket(st) != batt:
+                        batt = battery_bucket(st)
+                        write_battery_icon(*st)
+                        if not state_dirty:
+                            state_dirty_at = now_t
+                        state_dirty = True
+                        log(f"battery {st[0]}%{' charging' if st[1] else ''}")
+
+                if now_t - last_mic_check >= MIC_POLL:
+                    last_mic_check = now_t
+                    m = read_mic()
+                    if m is not None and m != mic:
+                        mic = m
+                        write_mic_icon(mic)
+                        if not state_dirty:
+                            state_dirty_at = now_t
+                        state_dirty = True
+                        log(f"mic {'muted' if mic else 'unmuted'}")
+
+                    n = read_flag(NIGHT_STATE)
+                    if n is not None and n != night:
+                        night = n
+                        swap_icon(NIGHT_SVG, NIGHT_SOURCES, night)
+                        if not state_dirty:
+                            state_dirty_at = now_t
+                        state_dirty = True
+                        log(f"nightlight {'on' if night else 'off'}")
+
+                if now_t - last_upd_check >= UPDATE_POLL:
+                    last_upd_check = now_t
+                    u = read_updates()
+                    if u is not None and u != upd:
+                        upd = u
+                        write_update_icon(upd)
+                        if not state_dirty:
+                            state_dirty_at = now_t
+                        state_dirty = True
+                        log(f"updates pending: {upd}")
+
+                if state_dirty and now_t - state_dirty_at >= STATE_COALESCE:
+                    state_dirty = False
+                    if current is not None:
+                        write_config(current, context)
+
+                if ctx_pending is not _UNSET and \
+                        time.monotonic() - ctx_pending_at >= CONTEXT_SETTLE:
+                    if ctx_pending != context:
+                        context = ctx_pending
+                        if current is not None:
+                            write_config(current, context)
+                        log(f"context: {context or 'default'}")
+                    ctx_pending = _UNSET
+
+                if pending is not None:
+                    wait = DEBOUNCE - (time.monotonic() - pending_at)
+                    if wait <= 0:
+                        if pending != current:
+                            current = pending
+                            t0 = time.monotonic()
+                            write_config(current, context)
+                            log(f"workspace {current} "
+                                f"({(time.monotonic() - t0) * 1000:.1f}ms write, "
+                                f"{(time.monotonic() - pending_at) * 1000:.0f}ms total)")
+                        pending = None
+                        continue
+                else:
+                    # Never sleep past the next battery check.
+                    wait = min(IDLE_POLL,
+                               max(0.05, BATTERY_POLL - (time.monotonic() - last_batt_check)),
+                               max(0.05, UPDATE_POLL - (time.monotonic() - last_upd_check)),
+                               max(0.05, MIC_POLL - (time.monotonic() - last_mic_check)),
+                               (max(0.05, CONTEXT_SETTLE - (time.monotonic() - ctx_pending_at))
+                                if ctx_pending is not _UNSET else IDLE_POLL),
+                               (max(0.02, STATE_COALESCE - (time.monotonic() - state_dirty_at))
+                                if state_dirty else IDLE_POLL))
+
+                if not select.select([s], [], [], wait)[0]:
+                    continue
+                try:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                except BlockingIOError:
+                    continue
+
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.decode("utf-8", "replace")
+                    name, _, args = line.partition(">>")
+                    ws = None
+                    if name in ("workspace", "workspacev2"):
+                        first = args.split(",")[0]
+                        ws = int(first) if first.lstrip("-").isdigit() else None
+                    elif name == "focusedmon":
+                        parts = args.split(",")
+                        if len(parts) > 1 and parts[1].lstrip("-").isdigit():
+                            ws = int(parts[1])
+                    if ws is not None:
+                        pending = ws
+                        pending_at = time.monotonic()
+                    elif name in ("openlayer", "closelayer"):
+                        if args.strip() != PANEL_NAMESPACE:
+                            continue
+                        if name == "openlayer":
+                            ctx_pending = read_context()
+                        else:
+                            # However the panel was dismissed, drop the layer.
+                            clear_context()
+                            ctx_pending = None
+                        ctx_pending_at = time.monotonic()
+        except Exception as e:
+            log(f"event socket lost ({e}), reconnecting")
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

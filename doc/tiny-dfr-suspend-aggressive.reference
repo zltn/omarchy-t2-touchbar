@@ -1,0 +1,137 @@
+#!/bin/sh
+# Work around tiny-dfr holding stale Touch Bar USB descriptors across suspend
+# on T2 MacBooks (Apple 05ac:8302, behind t2bce_vhci).
+#
+# This is the reason Omarchy removed tiny-dfr on T2 Macs in migration
+# 1785944594 ("the optional daemon holds stale device descriptors across
+# suspend with t2bce"). The daemon keeps the appletbdrm DRM device and the
+# USB configuration open; after resume the descriptors it holds no longer
+# match the re-enumerated device, and the Touch Bar comes back blank or the
+# daemon spins on write errors.
+#
+# The fix is to let go of the device entirely before sleep and force a real
+# USB re-enumeration after: bConfigurationValue 0 -> 2 rebuilds the interface
+# list, which re-triggers modalias autoload of appletbdrm (interface class
+# 0x10) before the daemon is allowed back in.
+#
+# Inspect afterwards with:  journalctl -b 0 -t tiny-dfr-suspend
+#
+# Installed at /usr/lib/systemd/system-sleep/tiny-dfr-suspend
+#
+# NOTE: it must live in /usr/lib, NOT /etc -- systemd 261 compiles in exactly
+# one hook directory and /etc/systemd/system-sleep/ is silently ignored. Same
+# constraint as the brcmfmac-suspend hook next to this one.
+
+TAG=tiny-dfr-suspend
+LOG() { logger -t "$TAG" -- "$*"; }
+RUN() { out=$("$@" 2>&1); rc=$?; [ -n "$out" ] && LOG "$* -> $out"; return $rc; }
+
+loaded() { grep -q '^appletbdrm ' /proc/modules; }
+
+# Whether appletbdrm has actually claimed the Touch Bar interface.
+#
+# Do NOT test /sys/class/drm/card0 -- the DRM card number is NOT stable. Every
+# unbind/rebind allocates a fresh one, so it climbs on each suspend cycle
+# (card0 at boot, card2 after a single bounce). Hardcoding card0 made this poll
+# wait out its full 3s timeout on every resume after the first, for a condition
+# that could never come true. The driver's own bind directory has no such
+# numbering and is what actually matters.
+bound() {
+  for i in /sys/bus/usb/drivers/appletbdrm/*:*; do
+    [ -e "$i" ] && return 0
+  done
+  return 1
+}
+
+# The USB path (5-6, 7-6, ...) is not stable across kernels or reboots, so
+# find it by product ID rather than hardcoding it.
+find_touchbar() {
+  for dev in /sys/bus/usb/devices/*/; do
+    [ -f "$dev/idProduct" ] || continue
+    [ "$(cat "$dev/idVendor" 2>/dev/null)" = "05ac" ] || continue
+    [ "$(cat "$dev/idProduct" 2>/dev/null)" = "8302" ] || continue
+    printf '%s' "${dev%/}"
+    return 0
+  done
+  return 1
+}
+
+case "$1" in
+  pre)
+    LOG "pre: starting (operation=$2)"
+
+    RUN systemctl stop tiny-dfr.service
+
+    # appletbdrm must go before the USB device is touched, otherwise the DRM
+    # device outlives the interface it is bound to.
+    for i in 1 2 3; do
+      loaded || break
+      RUN modprobe -r appletbdrm
+      loaded || break
+      LOG "pre: appletbdrm still loaded, retry $i"
+      sleep 1
+    done
+
+    if loaded; then
+      LOG "pre: appletbdrm unload FAILED, unbinding the interface instead"
+      dev=$(find_touchbar)
+      if [ -n "$dev" ] && [ -e /sys/bus/usb/drivers/appletbdrm/unbind ]; then
+        for intf in "$dev":*/; do
+          [ "$(cat "$intf/bInterfaceClass" 2>/dev/null)" = "10" ] || continue
+          basename "$intf" > /sys/bus/usb/drivers/appletbdrm/unbind 2>/dev/null
+          LOG "pre: unbound $(basename "$intf")"
+        done
+      fi
+    else
+      LOG "pre: appletbdrm unloaded cleanly"
+    fi
+    ;;
+
+  post)
+    LOG "post: restoring Touch Bar"
+
+    dev=$(find_touchbar)
+    if [ -z "$dev" ]; then
+      LOG "post: Touch Bar USB device not found, giving up"
+      exit 0
+    fi
+    LOG "post: found Touch Bar at $dev"
+
+    # Force re-enumeration. Config 1 is the HID-only Boot Camp mode; config 2
+    # is the one that exposes the class-0x10 interface appletbdrm binds to.
+    #
+    # These waits used to be `sleep 1` and `sleep 2`, which cost a flat 3s on
+    # EVERY resume. systemd-sleep does not thaw user.slice until every post
+    # hook returns, so that was 3s of unresponsive desktop, measured: suspend
+    # exit at .03, this hook finishing at .21, thaw immediately after. Polling
+    # for the actual condition instead finishes as soon as the hardware is
+    # ready, which is typically a fraction of that.
+    poll() {  # poll <max_deciseconds> <command...>
+      _max=$1; shift
+      _i=0
+      while [ "$_i" -lt "$_max" ]; do
+        "$@" && return 0
+        sleep 0.1
+        _i=$((_i + 1))
+      done
+      return 1
+    }
+
+    echo 0 > "$dev/bConfigurationValue" 2>/dev/null
+    poll 20 test ! -e "$dev/$(basename "$dev"):2.1" || LOG "post: interface did not detach in 2s, continuing"
+
+    echo 2 > "$dev/bConfigurationValue" 2>/dev/null
+    poll 30 test "$(cat "$dev/bConfigurationValue" 2>/dev/null)" = "2"       || LOG "post: bConfigurationValue did not reach 2 in 3s"
+    LOG "post: bConfigurationValue=$(cat "$dev/bConfigurationValue" 2>/dev/null)"
+
+    # modalias autoload usually handles this; modprobe covers the case where
+    # the device settled too slowly for udev.
+    poll 20 loaded || RUN modprobe appletbdrm
+    poll 30 bound || LOG "post: appletbdrm did not bind the device in 3s"
+
+    RUN systemctl start tiny-dfr.service
+    LOG "post: done (appletbdrm loaded=$(loaded && echo yes || echo no))"
+    ;;
+esac
+
+exit 0

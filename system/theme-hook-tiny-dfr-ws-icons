@@ -1,0 +1,6 @@
+#!/bin/bash
+# Re-colour the Touch Bar's active-workspace pills after a theme change.
+#
+# MUST be a bash script: omarchy-hook runs every hook with `bash "$hook"`,
+# ignoring the shebang, so a Python hook here hangs instead of running.
+exec "$HOME/.local/bin/tiny-dfr-ws-icons" "$@"

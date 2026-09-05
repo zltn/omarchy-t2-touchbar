@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically check for Omarchy updates for the Touch Bar
+
+[Timer]
+OnStartupSec=1min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Apply Touch Bar slider values.
+
+tiny-dfr publishes "<channel> <0.0-1.0>" datagrams to /run/tiny-dfr/slider.sock
+as you drag. It deliberately does not apply them itself: after PrivDrop it runs
+as `nobody`, which has no route to this user's PipeWire session or the
+backlight. This runs in the user session and does the applying.
+
+Two things matter for it to feel immediate:
+
+  * Applying must not block receiving. A drag emits a datagram roughly every
+    pixel, while wpctl costs ~35ms per call. Doing that inline backed the
+    socket queue up and the lag grew for as long as you kept dragging.
+    So a worker applies values while the reader keeps draining the socket,
+    and only ever applies the LATEST value per channel -- intermediate
+    positions you have already dragged past are dropped, not queued.
+
+  * Brightness goes straight to sysfs (~0.1ms) rather than through
+    omarchy-brightness-display (~119ms, it shells out 8 times internally).
+    That needs the backlight file to be group-writable; there is a fallback
+    to the script if it is not.
+"""
+
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+SOCKET = "/run/tiny-dfr/slider.sock"
+VALUE_DIR = "/run/tiny-dfr"
+BACKLIGHT = "/sys/class/backlight/acpi_video0"
+REFRESH = 5.0            # re-publish current values, to catch external changes
+
+_latest = {}
+_applied = {}
+_cv = threading.Condition()
+
+# The monitor panel does not watch sysfs -- it only learns about brightness
+# when something tells it, and writing sysfs directly tells it nothing. So the
+# UI is nudged separately, on its own thread, coalesced and throttled: at
+# ~45ms per IPC call it must never sit in the path that moves the hardware.
+#
+# The audio panel needs no equivalent: it binds to Pipewire.defaultAudioSink
+# and updates reactively on its own.
+_notify = {}
+_ncv = threading.Condition()
+NOTIFY_INTERVAL = 0.12
+
+# Mic mute state, for the Touch Bar's mic icon. Event-driven via
+# `pactl subscribe` rather than polled: a poll fast enough to feel responsive
+# would mean spawning wpctl several times a second forever.
+MIC_STATE = "/run/tiny-dfr/mic.state"
+
+# Nightlight state, for the Touch Bar's night icon. Polled, not evented:
+# hyprsunset publishes no events and its temperature is not reachable over
+# Hyprland's command socket ("unknown request"), so hyprctl is the only route.
+# At ~12ms a call, 2s is a fair trade for an on/off that changes rarely.
+NIGHT_STATE = "/run/tiny-dfr/night.state"
+NIGHT_POLL = 2.0
+NIGHT_ON_BELOW = 6000   # same threshold omarchy-toggle-nightlight uses
+
+# Lock state, so the Touch Bar can be forced dark (and therefore inert) while
+# the password screen is up. Polled slowly and deliberately: the query costs
+# ~136ms, and omarchy's lock never touches logind (omarchy-system-lock just
+# calls `omarchy-shell lock lock`), so LockedHint stays "no" and cannot be used.
+# Detection latency does not matter here -- the machine is unattended while
+# locked; what matters is that it is dark before anyone touches it.
+INHIBIT_PATH = "/run/tiny-dfr/inhibit"
+LOCK_POLL = 5.0
+
+
+def session_env():
+    """Environment these helpers need, derived rather than inherited.
+
+    A systemd USER unit starts before the session exports its variables, so
+    OMARCHY_PATH and HYPRLAND_INSTANCE_SIGNATURE are simply absent:
+      $ env -i PATH=/usr/bin omarchy-shell lock isLocked
+      OMARCHY_PATH is not set
+    Both watchers silently returned None forever and never fired -- the lock
+    blanking never actually ran. It appeared to work only when the service was
+    restarted by hand after login, which is exactly what testing did.
+    """
+    env = dict(os.environ)
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin")
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    if "HYPRLAND_INSTANCE_SIGNATURE" not in env:
+        import glob as _glob
+        for d in sorted(_glob.glob("/run/user/*/hypr/*/")):
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(d.rstrip("/"))
+            env.setdefault("XDG_RUNTIME_DIR", d.split("/hypr/")[0])
+            break
+    return env
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def publish(channel, value):
+    """Record the current value so tiny-dfr can seed its slider from it.
+
+    Without this a slider always drew itself at 0%: tiny-dfr has no way to ask
+    what the volume or brightness is.
+    """
+    try:
+        path = os.path.join(VALUE_DIR, f"{channel}.value")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{max(0.0, min(1.0, value)):.4f}\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception as e:
+        log(f"publish {channel} failed: {e}")
+
+
+def current_volume():
+    try:
+        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for tok in out.split():
+            try:
+                return float(tok)
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _backlight(name):
+    with open(os.path.join(BACKLIGHT, name)) as f:
+        return int(f.read().strip())
+
+
+def current_brightness():
+    try:
+        mx = _backlight("max_brightness")
+        return _backlight("brightness") / mx if mx > 0 else None
+    except Exception:
+        return None
+
+
+def set_brightness(value):
+    """Direct sysfs write when permitted, else the (much slower) omarchy path."""
+    path = os.path.join(BACKLIGHT, "brightness")
+    try:
+        mx = _backlight("max_brightness")
+        target = max(1, min(mx, round(value * mx)))
+        with open(path, "w") as f:
+            f.write(str(target))
+        return
+    except PermissionError:
+        pass
+    except Exception as e:
+        log(f"sysfs brightness failed: {e}")
+    subprocess.run(["omarchy-brightness-display", "--no-osd",
+                    f"{max(1, min(100, round(value * 100)))}%"],
+                   capture_output=True, timeout=5)
+
+
+def apply(channel, value):
+    try:
+        if channel == "volume":
+            subprocess.run(
+                ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+                 f"{max(0, min(100, round(value * 100)))}%"],
+                capture_output=True, timeout=5,
+            )
+        elif channel == "brightness":
+            set_brightness(value)
+            with _ncv:
+                _notify[channel] = value
+                _ncv.notify()
+        else:
+            log(f"unknown slider channel {channel!r}")
+            return
+        publish(channel, value)
+    except Exception as e:
+        log(f"apply {channel}={value:.2f} failed: {e}")
+
+
+def notifier():
+    """Tell the Omarchy panel about brightness, without delaying the hardware."""
+    last = 0.0
+    while True:
+        with _ncv:
+            while not _notify:
+                _ncv.wait()
+            wait = NOTIFY_INTERVAL - (time.monotonic() - last)
+            if wait > 0:
+                _ncv.wait(timeout=wait)
+            todo = dict(_notify)
+            _notify.clear()
+        for channel, value in todo.items():
+            if channel != "brightness":
+                continue
+            try:
+                subprocess.run(
+                    ["omarchy-shell", "-q", "omarchy.monitor", "brightness",
+                     str(max(1, min(100, round(value * 100))))],
+                    capture_output=True, timeout=5,
+                )
+            except Exception as e:
+                log(f"notify {channel} failed: {e}")
+        last = time.monotonic()
+
+
+def worker():
+    """Apply the newest pending value per channel, dropping anything staler."""
+    while True:
+        with _cv:
+            while not any(_applied.get(c) != v for c, v in _latest.items()):
+                _cv.wait()
+            todo = {c: v for c, v in _latest.items() if _applied.get(c) != v}
+            _applied.update(todo)
+        for channel, value in todo.items():
+            apply(channel, value)
+
+
+def mic_muted():
+    try:
+        out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return "MUTED" in out.upper()
+    except Exception:
+        return None
+
+
+def write_mic_state(muted):
+    try:
+        tmp = MIC_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("1\n" if muted else "0\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, MIC_STATE)
+    except Exception as e:
+        log(f"mic state write failed: {e}")
+
+
+def mic_watcher():
+    """Publish mic mute state, driven by PulseAudio/PipeWire events."""
+    last = None
+    cur = mic_muted()
+    if cur is not None:
+        write_mic_state(cur)
+        last = cur
+    while True:
+        try:
+            proc = subprocess.Popen(["pactl", "subscribe"],
+                                    stdout=subprocess.PIPE, text=True)
+            for line in proc.stdout:
+                # Only source/server events can change mic mute; ignoring the
+                # rest keeps this from spawning wpctl on every sink tick.
+                if "source" not in line and "server" not in line:
+                    continue
+                cur = mic_muted()
+                if cur is not None and cur != last:
+                    write_mic_state(cur)
+                    last = cur
+                    log(f"mic {'muted' if cur else 'unmuted'}")
+        except Exception as e:
+            log(f"mic watcher restarting: {e}")
+        time.sleep(2)
+
+
+def night_on():
+    """True when the screen is warmed, False when neutral, None if unknown."""
+    try:
+        out = subprocess.run(["hyprctl", "hyprsunset", "temperature"],
+                             capture_output=True, text=True, timeout=5,
+                             env=session_env()).stdout
+        digits = "".join(ch if ch.isdigit() else " " for ch in out).split()
+        if not digits:
+            return None
+        return int(digits[0]) < NIGHT_ON_BELOW
+    except Exception:
+        return None
+
+
+def session_locked():
+    try:
+        out = subprocess.run(["omarchy-shell", "lock", "isLocked"],
+                             capture_output=True, text=True, timeout=10,
+                             env=session_env()).stdout
+        v = out.strip().lower()
+        if v in ("true", "false"):
+            return v == "true"
+    except Exception:
+        pass
+    return None
+
+
+def lock_watcher():
+    """Force the Touch Bar dark while the session is locked."""
+    last = None
+    while True:
+        cur = session_locked()
+        if cur is not None and cur != last:
+            try:
+                if cur:
+                    open(INHIBIT_PATH, "w").close()
+                    os.chmod(INHIBIT_PATH, 0o644)
+                else:
+                    try:
+                        os.unlink(INHIBIT_PATH)
+                    except FileNotFoundError:
+                        pass
+                log(f"session {'locked - touchbar inhibited' if cur else 'unlocked'}")
+                last = cur
+            except Exception as e:
+                log(f"inhibit toggle failed: {e}")
+        time.sleep(LOCK_POLL)
+
+
+def night_watcher():
+    last = None
+    while True:
+        cur = night_on()
+        if cur is not None and cur != last:
+            try:
+                tmp = NIGHT_STATE + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write("1\n" if cur else "0\n")
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, NIGHT_STATE)
+                log(f"nightlight {'on' if cur else 'off'}")
+            except Exception as e:
+                log(f"night state write failed: {e}")
+            last = cur
+        time.sleep(NIGHT_POLL)
+
+
+def refresh_values():
+    v = current_volume()
+    if v is not None:
+        publish("volume", v)
+    b = current_brightness()
+    if b is not None:
+        publish("brightness", b)
+
+
+def main():
+    os.makedirs(VALUE_DIR, exist_ok=True)
+    try:
+        os.unlink(SOCKET)
+    except FileNotFoundError:
+        pass
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(SOCKET)
+    # tiny-dfr sends as `nobody`, so the socket must be world-writable.
+    os.chmod(SOCKET, 0o666)
+
+    direct = os.access(os.path.join(BACKLIGHT, "brightness"), os.W_OK)
+    log(f"listening on {SOCKET} (brightness: "
+        f"{'direct sysfs' if direct else 'via omarchy script, slower'})")
+
+    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=notifier, daemon=True).start()
+    threading.Thread(target=mic_watcher, daemon=True).start()
+    threading.Thread(target=night_watcher, daemon=True).start()
+    threading.Thread(target=lock_watcher, daemon=True).start()
+
+    refresh_values()
+    last_refresh = time.monotonic()
+
+    while True:
+        sock.settimeout(REFRESH)
+        try:
+            data, _ = sock.recvfrom(256)
+            parts = data.decode("utf-8", "replace").split()
+            if len(parts) != 2:
+                continue
+            channel, raw = parts
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            with _cv:
+                _latest[channel] = value
+                _cv.notify()
+        except socket.timeout:
+            # Pick up changes made elsewhere (media keys, the panel itself) so
+            # reopening a slider shows the truth.
+            if time.monotonic() - last_refresh >= REFRESH:
+                refresh_values()
+                last_refresh = time.monotonic()
+
+
+if __name__ == "__main__":
+    main()

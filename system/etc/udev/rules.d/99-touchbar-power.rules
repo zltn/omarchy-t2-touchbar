@@ -1,0 +1,3 @@
+# Apple Touch Bar (05ac:8302) -- never autosuspend; it does not come back
+# reliably from a deep USB sleep on T2 hardware.
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="8302", ATTR{power/control}="on", ATTR{power/autosuspend_delay_ms}="-1"

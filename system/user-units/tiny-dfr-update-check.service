@@ -1,0 +1,6 @@
+[Unit]
+Description=Check for Omarchy updates for the Touch Bar indicator
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tiny-dfr-update-check

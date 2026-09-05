@@ -1,0 +1,30 @@
+#!/bin/bash
+# Open an Omarchy panel AND switch the Touch Bar to its contextual layer.
+#
+# Why the Touch Bar cannot simply detect which panel is open:
+#   * every Omarchy panel is the same Hyprland layer surface, namespace
+#     "omarchy-keyboard-panel", at identical geometry -- audio, display,
+#     network and power are indistinguishable from outside.
+#   * the shell tracks it internally (shell.qml: openPanelIds, isPluginOpen)
+#     but does not expose it over IPC; the shell IpcHandler offers only ping,
+#     applyTheme, rescanPlugins, reloadConfig, toggleBarTransparency,
+#     setPluginEnabled, enablePlugin, put/move/setBarWidget and listPlugins.
+#
+# So the trigger declares the context instead of the Touch Bar inferring it.
+# Consequence, and it is a real one: opening a panel by CLICKING ITS BAR ICON
+# with the mouse does not route through here, so the Touch Bar will not switch.
+# Keyboard shortcuts and Touch Bar buttons both do.
+#
+# closelayer>>omarchy-keyboard-panel DOES fire reliably, so the daemon always
+# knows when to drop back to the default layer however the panel was closed.
+set -uo pipefail
+
+CONTEXT=${1:?usage: tiny-dfr-context <context> <shell-target>}
+TARGET=${2:?usage: tiny-dfr-context <context> <shell-target>}
+STATE=/etc/tiny-dfr/context.state
+
+tmp="${STATE}.tmp"
+printf '%s\n' "$CONTEXT" >"$tmp" 2>/dev/null && chmod 644 "$tmp" 2>/dev/null \
+  && mv -f "$tmp" "$STATE" 2>/dev/null || true
+
+exec omarchy-shell shell toggle "$TARGET"

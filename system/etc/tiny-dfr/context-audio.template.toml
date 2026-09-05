@@ -1,0 +1,49 @@
+# Contextual Touch Bar layer: shown while the Omarchy audio panel is open.
+# GENERATED INTO config.toml by tiny-dfr-workspace -- edit this file, not that.
+#
+# Uses the locally patched tiny-dfr, which adds a real Slider button type. Those are absolute levels via wpctl; the -/+ keys are the
+# normal relative media keys and show the Omarchy OSD.
+
+MediaLayerDefault = true
+DoublePressSwitchLayers = 200
+EnablePixelShift = true
+ShowButtonOutlines = true
+AdaptiveBrightness = true
+
+MediaLayerKeys = [
+@WORKSPACES@
+
+    { Stretch = 1 },
+
+    { Icon = "volume_off",  Action = "Mute"       },
+    { Icon = "volume_down", Action = "VolumeDown" },
+    { Icon = "volume_up",   Action = "VolumeUp"   },
+
+    { Stretch = 1 },
+
+    # Real slider: drag anywhere along it. tiny-dfr publishes the value to
+    # /run/tiny-dfr/slider.sock and tiny-dfr-slider.service applies it.
+    { Slider = "volume", Stretch = 8 },
+
+    { Stretch = 1 },
+
+    # mic.svg is regenerated from the live mute state by
+    # tiny-dfr-workspace, so the slash appears only when actually muted.
+    { Icon = "mic", Action = "MicMute" },
+    { Time = "%a %H:%M", Action = "Time", Stretch = 3 }
+]
+
+PrimaryLayerKeys = [
+    { Text = "F1",  Action = "F1"  },
+    { Text = "F2",  Action = "F2"  },
+    { Text = "F3",  Action = "F3"  },
+    { Text = "F4",  Action = "F4"  },
+    { Text = "F5",  Action = "F5"  },
+    { Text = "F6",  Action = "F6"  },
+    { Text = "F7",  Action = "F7"  },
+    { Text = "F8",  Action = "F8"  },
+    { Text = "F9",  Action = "F9"  },
+    { Text = "F10", Action = "F10" },
+    { Text = "F11", Action = "F11" },
+    { Text = "F12", Action = "F12" }
+]

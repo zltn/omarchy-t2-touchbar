@@ -1,0 +1,20 @@
+# The tiny-dfr package owns /etc/tiny-dfr, so an upgrade resets its group and
+# mode, undoing the setgid that lets the Touch Bar layout be edited without
+# sudo. Put it back after every install/upgrade of the package.
+#
+# The generated files need more than the directory bit. They are written IN
+# PLACE by the shell plugin running as @USER@ -- in place rather than
+# atomically, because tiny-dfr reads them as `nobody` and an atomic replace
+# would recreate them under the writer's umask. So they must be group-writable
+# by @USER@ and readable by everyone, or the plugin silently stops updating the
+# strip and tiny-dfr falls back to the packaged layout without logging a thing.
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = tiny-dfr
+
+[Action]
+Description = Restoring /etc/tiny-dfr ownership and generated-file modes...
+When = PostTransaction
+Exec = /bin/sh -c 'chown -R root:@USER@ /etc/tiny-dfr && chmod 2775 /etc/tiny-dfr && for f in config.toml battery.svg update.svg mic.svg night.svg context.state update.state; do [ -e "/etc/tiny-dfr/$f" ] && chmod 0664 "/etc/tiny-dfr/$f"; done; exit 0'

@@ -1,0 +1,37 @@
+[Unit]
+Description=Highlight the active Hyprland workspace on the Touch Bar
+Documentation=man:tiny-dfr(1)
+After=graphical.target tiny-dfr.service
+Wants=tiny-dfr.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/tiny-dfr/tiny-dfr-workspace
+Restart=always
+RestartSec=2
+
+# Writes /etc/tiny-dfr/config.toml and reads the user's Hyprland event socket
+# under /run/user/*/hypr/.
+#
+# ProtectHome MUST stay off: ProtectHome=true makes /home, /root *and*
+# /run/user inaccessible and empty -- which is exactly where the Hyprland
+# socket lives, so the daemon silently found nothing and idled forever.
+# ProtectSystem=full (not strict) for the same class of reason: strict mounts
+# the whole hierarchy read-only including /run, and connect() on a unix socket
+# needs write permission on the socket inode.
+ProtectHome=no
+ProtectSystem=full
+ReadWritePaths=/etc/tiny-dfr
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=graphical.target

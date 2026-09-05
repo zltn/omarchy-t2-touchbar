@@ -1,0 +1,10 @@
+# Generated at runtime by the plugin / tiny-dfr-ws-icons, never committed:
+# they are machine- and theme-specific and are rebuilt on first run.
+system/etc/tiny-dfr/config.toml
+system/etc/tiny-dfr/ws*_active.svg
+system/etc/tiny-dfr/battery.svg
+system/etc/tiny-dfr/update.svg
+system/etc/tiny-dfr/*.state
+*.tmp
+node_modules/
+__pycache__/
