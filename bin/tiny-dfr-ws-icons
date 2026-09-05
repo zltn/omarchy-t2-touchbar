@@ -78,6 +78,11 @@ def contrast(l1, l2):
 
 
 def main():
+    # install.sh regenerates the pills before the plugin is enabled and before
+    # the daemon should be running; without this flag the redraw fallback below
+    # would `systemctl restart` the daemon into life on a machine about to use
+    # the plugin, leaving two writers on config.toml.
+    redraw = "--no-redraw" not in sys.argv[1:]
     c1, c2, angle = active_border()
 
     # Judge the digit against the mean of the two stops, so a steep gradient
@@ -130,6 +135,8 @@ def main():
     # restart. Try the plugin first and fall back, so this one hook works for
     # both setups -- and so a theme change does not silently leave the pills in
     # the previous theme's colour.
+    if not redraw:
+        return
     redrawn = False
     try:
         # Deliberately NOT `omarchy-shell -q`: quiet mode suppresses stdout and

@@ -1,0 +1,380 @@
+diff --git i/src/backlight.rs w/src/backlight.rs
+index 85d6a6c..79acf13 100644
+--- i/src/backlight.rs
++++ w/src/backlight.rs
+@@ -19,6 +19,17 @@ const BRIGHTNESS_DIM_TIMEOUT: i32 = TIMEOUT_MS * 3; // should be a multiple of T
+ const BRIGHTNESS_OFF_TIMEOUT: i32 = TIMEOUT_MS * 6; // should be a multiple of TIMEOUT_MS
+ const DIMMED_BRIGHTNESS: u32 = 1;
+ 
++/// While this file exists the Touch Bar is forced dark and, because touch input
++/// is gated on the backlight being non-zero, becomes inert.
++///
++/// This exists because a keypress wakes the Touch Bar: process_event() refreshes
++/// last_active for Keyboard events as well as Touch, and tiny-dfr watches the
++/// main keyboard too. So dismissing a screensaver lights the strip up while the
++/// lock screen has focus, and a palm crossing it types real keys into the
++/// password field -- the workspace buttons send Super+digit, which a lock
++/// surface does not consume as a shortcut.
++const INHIBIT_PATH: &str = "/run/tiny-dfr/inhibit";
++
+ fn read_attr(path: &Path, attr: &str) -> u32 {
+     fs::read_to_string(path.join(attr))
+         .unwrap_or_else(|_| panic!("Failed to read {attr}"))
+@@ -120,7 +131,9 @@ impl BacklightManager {
+         let since_last_active = (Instant::now() - self.last_active).as_millis() as u64;
+         let new_bl = min(
+             self.max_bl,
+-            if self.lid_state == SwitchState::On {
++            if Path::new(INHIBIT_PATH).exists() {
++                0
++            } else if self.lid_state == SwitchState::On {
+                 0
+             } else if since_last_active < BRIGHTNESS_DIM_TIMEOUT as u64 {
+                 if cfg.adaptive_brightness {
+diff --git i/src/config.rs w/src/config.rs
+index 063c318..d34c43d 100644
+--- i/src/config.rs
++++ w/src/config.rs
+@@ -15,6 +15,8 @@ use serde::{
+ use std::{fmt, fs::read_to_string, os::fd::AsFd};
+ 
+ const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
++const USER_CFG_DIR: &str = "/etc/tiny-dfr";
++const USER_CFG_NAME: &str = "config.toml";
+ 
+ pub struct Config {
+     pub show_button_outlines: bool,
+@@ -75,6 +77,9 @@ pub struct ButtonConfig {
+     pub theme: Option<String>,
+     pub time: Option<String>,
+     pub battery: Option<String>,
++    /// Continuous control. The value is reported to the slider socket as
++    /// "<name> <0.0-1.0>"; tiny-dfr itself stays policy-free.
++    pub slider: Option<String>,
+     pub locale: Option<String>,
+     #[serde(deserialize_with = "array_or_single", default)]
+     pub action: Vec<Key>,
+@@ -131,6 +136,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
+                     time: None,
+                     locale: None,
+                     battery: None,
++                    slider: None,
+                     icon_width: None,
+                     icon_height: None,
+                 },
+@@ -160,9 +166,18 @@ pub struct ConfigManager {
+     watch_desc: Option<WatchDescriptor>,
+ }
+ 
++/// Watch the config's DIRECTORY, persistently.
++///
++/// Watching the file itself was unreliable in two separate ways. IN_MOVED_TO
++/// is a directory-only event, so on a file watch it never fires -- yet an
++/// atomic replace (write temp, rename over) is the only safe way to rewrite a
++/// config, and rename is exactly what it would have caught. And IN_ONESHOT
++/// drops the watch after every event, so any change arriving between the event
++/// and the re-arm is lost with no trace: a burst of updates would apply the
++/// first and silently discard the rest.
+ fn arm_inotify(inotify_fd: &Inotify) -> Option<WatchDescriptor> {
+-    let flags = AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CLOSE | AddWatchFlags::IN_ONESHOT;
+-    match inotify_fd.add_watch(USER_CFG_PATH, flags) {
++    let flags = AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CLOSE_WRITE;
++    match inotify_fd.add_watch(USER_CFG_DIR, flags) {
+         Ok(wd) => Some(wd),
+         Err(Errno::ENOENT) => None,
+         e => Some(e.unwrap()),
+@@ -203,11 +218,16 @@ impl ConfigManager {
+             if Some(evt.wd) != self.watch_desc {
+                 continue;
+             }
++            // Directory watch: ignore the sibling files (icons, templates,
++            // state) and the temp files an atomic replace leaves behind.
++            match evt.name.as_deref().and_then(|n| n.to_str()) {
++                Some(name) if name == USER_CFG_NAME => {}
++                _ => continue,
++            }
+             let parts = load_config(width);
+             *cfg = parts.0;
+             *layers = parts.1;
+             ret = true;
+-            self.watch_desc = arm_inotify(&self.inotify_fd);
+         }
+         ret
+     }
+diff --git i/src/main.rs w/src/main.rs
+index cd8de7c..88f7df8 100644
+--- i/src/main.rs
++++ w/src/main.rs
+@@ -94,6 +94,8 @@ enum ButtonImage {
+     Bitmap(ImageSurface),
+     Time(Vec<ChronoItem<'static>>, Locale),
+     Battery(String, BatteryIconMode, BatteryImages),
++    /// Channel name plus the current value in 0.0..=1.0.
++    Slider(String, f64),
+     Spacer,
+ }
+ 
+@@ -265,6 +267,8 @@ impl Button {
+             )
+         } else if let Some(time) = cfg.time {
+             Button::new_time(cfg.action, &time, cfg.locale.as_deref())
++        } else if let Some(slider) = cfg.slider {
++            Button::new_slider(slider, cfg.action)
+         } else if let Some(battery_mode) = cfg.battery {
+             if let Some(battery) = find_battery_device() {
+                 Button::new_battery(cfg.action, battery, battery_mode, cfg.theme)
+@@ -285,6 +289,20 @@ impl Button {
+             icon_height: 0.0,
+         }
+     }
++    fn new_slider(channel: String, action: Vec<Key>) -> Button {
++        // Seed from the live value so the knob starts where the control
++        // actually is. The listener in the user session keeps this file
++        // current; tiny-dfr cannot query PipeWire itself after PrivDrop.
++        let initial = read_slider_value(&channel);
++        Button {
++            action,
++            active: false,
++            changed: false,
++            image: ButtonImage::Slider(channel, initial),
++            icon_width: 0.0,
++            icon_height: 0.0,
++        }
++    }
+     fn new_text(text: String, action: Vec<Key>) -> Button {
+         Button {
+             action,
+@@ -453,6 +471,36 @@ impl Button {
+                 );
+                 c.show_text(&formatted_time).unwrap();
+             }
++            ButtonImage::Slider(_, value) => {
++                let track_h = (height as f64 * 0.34).round();
++                let inset = 14.0f64.min(button_width as f64 / 6.0);
++                let x0 = button_left_edge + inset;
++                let w = button_width as f64 - inset * 2.0;
++                let y0 = y_shift + ((height as f64 - track_h) / 2.0).round();
++                let r = track_h / 2.0;
++
++                // Track.
++                c.set_source_rgb(0.25, 0.25, 0.25);
++                rounded_rect(&c, x0, y0, w, track_h, r);
++                c.fill().unwrap();
++
++                // Filled portion.
++                let fill_w = (w * value.clamp(0.0, 1.0)).max(0.0);
++                if fill_w > 1.0 {
++                    c.set_source_rgb(1.0, 1.0, 1.0);
++                    rounded_rect(&c, x0, y0, fill_w, track_h, r);
++                    c.fill().unwrap();
++                }
++
++                // Knob, kept fully inside the track at both extremes.
++                // NOTE: clamp order matters. knob_r.min(fill_w.max(knob_r)) is
++                // always knob_r, which pins the knob in place.
++                let knob_r = (track_h * 0.72).min(w / 2.0);
++                let kx = x0 + fill_w.clamp(knob_r, (w - knob_r).max(knob_r));
++                c.set_source_rgb(1.0, 1.0, 1.0);
++                c.arc(kx, y0 + track_h / 2.0, knob_r, 0.0, std::f64::consts::TAU);
++                c.fill().unwrap();
++            }
+             ButtonImage::Battery(battery, battery_mode, icons) => {
+                 let (capacity, state) = get_battery_state(battery);
+                 let icon = if battery_mode.should_draw_icon() {
+@@ -526,6 +574,26 @@ impl Button {
+             toggle_keys(uinput, &self.action, active as i32);
+         }
+     }
++    /// Returns true when this is a slider and the value moved enough to redraw.
++    /// The 0.004 threshold is about one pixel of travel: without it every
++    /// touch-motion event would mark the strip dirty.
++    fn set_slider(&mut self, fraction: f64) -> bool {
++        let f = fraction.clamp(0.0, 1.0);
++        if let ButtonImage::Slider(channel, value) = &mut self.image {
++            if (*value - f).abs() < 0.004 {
++                return false;
++            }
++            *value = f;
++            let channel = channel.clone();
++            self.changed = true;
++            publish_slider(&channel, f);
++            return true;
++        }
++        false
++    }
++    fn is_slider(&self) -> bool {
++        matches!(self.image, ButtonImage::Slider(_, _))
++    }
+     fn set_background_color(&self, c: &Context, color: f64) {
+         if let ButtonImage::Battery(battery, _, _) = &self.image {
+             let (_, state) = get_battery_state(battery);
+@@ -718,6 +786,28 @@ impl FunctionLayer {
+         modified_regions
+     }
+ 
++    /// Horizontal bounds of button `i`, in the same coordinate space hit()
++    /// uses. Needed to turn an absolute touch x into a slider fraction.
++    fn button_bounds(&self, width: u16, i: usize) -> Option<(f64, f64)> {
++        if i >= self.buttons.len() {
++            return None;
++        }
++        let virtual_button_width =
++            (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
++                / self.virtual_button_count as f64;
++        let start = self.buttons[i].0;
++        let end = if i + 1 < self.buttons.len() {
++            self.buttons[i + 1].0
++        } else {
++            self.virtual_button_count
++        };
++        let left = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
++        let w = virtual_button_width
++            + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
++                .floor();
++        Some((left, w))
++    }
++
+     fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+         let virtual_button_width =
+             (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
+@@ -779,6 +869,42 @@ impl LibinputInterface for Interface {
+     }
+ }
+ 
++/// Where slider values are published. tiny-dfr does not apply them itself: it
++/// runs as `nobody` after PrivDrop and has no business talking to the user's
++/// PipeWire or backlight. A listener in the user session does that.
++const SLIDER_SOCKET: &str = "/run/tiny-dfr/slider.sock";
++
++/// Current value of a channel, as maintained by the listener. Returns 0.0 when
++/// unknown, which is the only sane default with nothing to read.
++fn read_slider_value(channel: &str) -> f64 {
++    std::fs::read_to_string(format!("/run/tiny-dfr/{}.value", channel))
++        .ok()
++        .and_then(|s| s.trim().parse::<f64>().ok())
++        .map(|v| v.clamp(0.0, 1.0))
++        .unwrap_or(0.0)
++}
++
++/// Best-effort, non-blocking, fire-and-forget. A missing or unreadable socket
++/// must never disturb drawing, so every error here is swallowed deliberately.
++fn publish_slider(channel: &str, value: f64) {
++    use std::os::unix::net::UnixDatagram;
++    let Ok(sock) = UnixDatagram::unbound() else {
++        return;
++    };
++    let _ = sock.set_nonblocking(true);
++    let _ = sock.send_to(format!("{} {:.4}", channel, value).as_bytes(), SLIDER_SOCKET);
++}
++
++fn rounded_rect(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
++    let r = r.min(w / 2.0).min(h / 2.0);
++    c.new_sub_path();
++    c.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
++    c.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
++    c.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
++    c.arc(x + r, y + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
++    c.close_path();
++}
++
+ fn emit<F>(uinput: &mut UInputHandle<F>, ty: EventKind, code: u16, value: i32)
+ where
+     F: AsRawFd,
+@@ -1020,10 +1146,26 @@ fn real_main(drm: &mut DrmBackend) {
+                             let x = dn.x_transformed(width as u32);
+                             let y = dn.y_transformed(height as u32);
+                             if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
+-                                touches.insert(dn.seat_slot(), (active_layer, btn));
+-                                layers[active_layer].buttons[btn]
+-                                    .1
+-                                    .set_active(&mut uinput, true);
++                                // Remember the keys pressed here, rather than
++                                // re-resolving the button on release: a config
++                                // reload between down and up replaces `layers`,
++                                // and the stale index would release the wrong
++                                // button, leaving these keys stuck down.
++                                let keys = layers[active_layer].buttons[btn].1.action.clone();
++                                touches.insert(dn.seat_slot(), (active_layer, btn, keys));
++                                if layers[active_layer].buttons[btn].1.is_slider() {
++                                    if let Some((left, w)) =
++                                        layers[active_layer].button_bounds(width, btn)
++                                    {
++                                        layers[active_layer].buttons[btn]
++                                            .1
++                                            .set_slider((x - left) / w);
++                                    }
++                                } else {
++                                    layers[active_layer].buttons[btn]
++                                        .1
++                                        .set_active(&mut uinput, true);
++                                }
+                             }
+                         }
+                         TouchEvent::Motion(mtn) => {
+@@ -1033,18 +1175,56 @@ fn real_main(drm: &mut DrmBackend) {
+ 
+                             let x = mtn.x_transformed(width as u32);
+                             let y = mtn.y_transformed(height as u32);
+-                            let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
+-                            let hit = layers[active_layer]
+-                                .hit(width, height, x, y, Some(btn))
+-                                .is_some();
+-                            layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+-                        }
+-                        TouchEvent::Up(up) => {
+-                            if !touches.contains_key(&up.seat_slot()) {
++                            let (layer, btn, _) = touches.get(&mtn.seat_slot()).unwrap().clone();
++                            if layer >= layers.len() || btn >= layers[layer].buttons.len() {
+                                 continue;
+                             }
+-                            let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
+-                            layers[layer].buttons[btn].1.set_active(&mut uinput, false);
++                            if layers[layer].buttons[btn].1.is_slider() {
++                                // A slider tracks the finger across the whole
++                                // strip, so it deliberately does not use hit():
++                                // dragging past either end should saturate, not
++                                // cancel.
++                                if let Some((left, w)) = layers[layer].button_bounds(width, btn) {
++                                    layers[layer].buttons[btn].1.set_slider((x - left) / w);
++                                }
++                            } else {
++                                // Motion may only CANCEL a press, never re-arm
++                                // one. hit() rejects anything outside
++                                // 0.1..0.9 of the strip height -- barely 6px
++                                // of margin on a 60px panel -- so a finger
++                                // resting near an edge flickers in and out of
++                                // it. Re-activating on the way back in emits a
++                                // second key press, which fires the binding
++                                // twice: the panel it opened is toggled shut
++                                // again by the same tap.
++                                let hit = layers[active_layer]
++                                    .hit(width, height, x, y, Some(btn))
++                                    .is_some();
++                                if !hit {
++                                    layers[layer].buttons[btn]
++                                        .1
++                                        .set_active(&mut uinput, false);
++                                }
++                            }
++                        }
++                        TouchEvent::Up(up) => {
++                            let Some((layer, btn, keys)) = touches.remove(&up.seat_slot()) else {
++                                continue;
++                            };
++                            // Release what was actually pressed. If the config
++                            // reloaded mid-touch the indices below are stale,
++                            // but these keys still have to come back up or they
++                            // stay held down for the rest of the session.
++                            if !keys.is_empty() {
++                                toggle_keys(&mut uinput, &keys, 0);
++                            }
++                            if layer < layers.len() && btn < layers[layer].buttons.len() {
++                                let b = &mut layers[layer].buttons[btn].1;
++                                if b.active {
++                                    b.active = false;
++                                    b.changed = true;
++                                }
++                            }
+                         }
+                         _ => {}
+                     }

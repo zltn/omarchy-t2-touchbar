@@ -81,8 +81,21 @@ for (const c of expected.readFlag) {
 
 // Full config render against the real template, so @WORKSPACES@ substitution
 // is checked in place rather than in isolation.
-eq("renderConfig", TouchBar.renderConfig(expected.template.input, 5, 3),
+eq("renderConfig", TouchBar.renderConfig(expected.template.input, 5, 3, false),
   expected.template.out)
+
+// Context templates with the slider on and off. Stock tiny-dfr must never see
+// a Slider key, and the token itself must never survive rendering.
+for (const c of expected.contextTemplates) {
+  const got = TouchBar.renderConfig(c.input, 5, 2, c.slider)
+  eq(`context-${c.name} slider=${c.slider}`, got, c.out)
+  checks++
+  if (/@SLIDER:/.test(got)) { failures++; console.log(`FAIL context-${c.name}: token left behind`) }
+  checks++
+  if (!c.slider && /Slider\s*=/.test(got)) { failures++; console.log(`FAIL context-${c.name}: Slider key with slider=false`) }
+  checks++
+  if (c.slider && !/Slider\s*=/.test(got)) { failures++; console.log(`FAIL context-${c.name}: no Slider key with slider=true`) }
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

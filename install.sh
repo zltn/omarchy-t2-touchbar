@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the system half of the T2 Touch Bar stack.
+# Install the system half of the T2 Touch Bar stack, then the shell plugin.
 #
 # The Omarchy plugin (manifest.json + Service.qml, at the root of this repo)
 # only draws the layout. Everything the layout depends on -- the tiny-dfr
@@ -9,10 +9,10 @@
 # That is what this script is for.
 #
 #   ./install.sh              install everything
-#   ./install.sh --no-plugin  system half only, leaving the shell alone
+#   ./install.sh --no-plugin  system half only, driven by the standalone daemon
 #   ./install.sh --dry-run    print what would change and exit
 #
-# Safe to re-run: every step is idempotent.
+# Safe to re-run: every step is idempotent. Re-run after ./build-tiny-dfr.sh.
 
 set -euo pipefail
 
@@ -20,12 +20,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY=0
 WITH_PLUGIN=1
 WORKSPACES="${WORKSPACES:-5}"
+PLUGIN_ID=t2.touchbar
 
 while (( $# > 0 )); do
   case "$1" in
     --dry-run)   DRY=1; shift ;;
     --no-plugin) WITH_PLUGIN=0; shift ;;
-    -h|--help)   sed -n '2,18p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)   sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -75,17 +76,39 @@ say "Model: $MODEL, installing for user: $TARGET_USER"
 
 command -v hyprctl >/dev/null || warn "hyprctl not found; the workspace layer needs Hyprland."
 
+# Omarchy's own installer adds the t2linux arch-mact2 repo on T2 hardware, so
+# the package is normally one pacman away. `omarchy refresh pacman` can drop
+# that repo again, which is the usual reason this check fails.
 if ! pacman -Q tiny-dfr >/dev/null 2>&1; then
-  warn "The 'tiny-dfr' package is not installed."
-  warn "Get it from the t2linux arch-mact2 repo, e.g."
-  warn "  sudo pacman -U https://mirror.funami.tech/arch-mact2/os/x86_64/tiny-dfr-<ver>-x86_64.pkg.tar.zst"
-  warn ""
-  warn "NOTE: Omarchy deliberately uninstalls tiny-dfr on T2 Macs (migration"
-  warn "1785944594) because the optional daemon held stale device descriptors"
-  warn "across suspend. The gentle sleep hook installed here is the answer to"
-  warn "that -- see doc/SUSPEND.md. If the Touch Bar goes blank after an"
-  warn "'omarchy update', check the package still exists before debugging."
-  (( DRY )) || die "install tiny-dfr first, then re-run"
+  if pacman -Si tiny-dfr >/dev/null 2>&1; then
+    say "Installing the tiny-dfr package"
+    run sudo pacman -S --needed --noconfirm tiny-dfr
+  else
+    warn "The 'tiny-dfr' package is not installed and no configured repo provides it."
+    warn "It lives in the t2linux arch-mact2 repo, which Omarchy configures on T2"
+    warn "Macs at install time. Check /etc/pacman.conf for [arch-mact2]; if it is"
+    warn "missing, Omarchy's install/hardware/pacman.sh shows the two lines to add."
+    (( DRY )) || die "install tiny-dfr first, then re-run"
+  fi
+fi
+
+# Omarchy deliberately removes tiny-dfr on T2 Macs (migration 1785944594)
+# because the daemon held stale device descriptors across suspend. The gentle
+# sleep hook installed below is this repo's answer; see doc/SUSPEND.md. The
+# removal is a one-off migration, not a blacklist, so a reinstall sticks --
+# until a future migration says otherwise. If the strip goes blank after an
+# `omarchy update`, check the package still exists before debugging.
+
+# The slider patch is optional. Its presence decides three things below: the
+# service drop-in, the slider units, and SLIDER= in touchbar.conf, which tells
+# the renderer whether it may emit a Slider key at all.
+SLIDER=0
+if [[ -x /usr/local/bin/tiny-dfr ]]; then
+  SLIDER=1
+  say "Found /usr/local/bin/tiny-dfr: enabling the slider layers"
+else
+  say "No patched tiny-dfr in /usr/local/bin: contextual layers use stepped levels"
+  say "  (optional: ./build-tiny-dfr.sh, then re-run this script)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -103,20 +126,25 @@ done
 run sudo chown -R "root:$TARGET_USER" /etc/tiny-dfr
 run sudo chmod 2775 /etc/tiny-dfr
 
-if [[ ! -f /etc/tiny-dfr/touchbar.conf ]] || (( DRY )); then
-  say "Writing /etc/tiny-dfr/touchbar.conf (WORKSPACES=$WORKSPACES)"
-  if (( DRY )); then
-    printf '   would: write /etc/tiny-dfr/touchbar.conf\n'
-  else
-    sudo install -Dm0664 -o root -g "$TARGET_USER" /dev/stdin /etc/tiny-dfr/touchbar.conf <<EOF
-# Per-machine Touch Bar settings. Read by both the QML plugin and the Python
+say "Writing /etc/tiny-dfr/touchbar.conf (WORKSPACES=$WORKSPACES SLIDER=$SLIDER)"
+if (( DRY )); then
+  printf '   would: write /etc/tiny-dfr/touchbar.conf\n'
+else
+  # WORKSPACES is the user's to keep; SLIDER follows the binary and is rewritten.
+  if [[ -f /etc/tiny-dfr/touchbar.conf ]]; then
+    WORKSPACES=$(sed -n 's/^\s*WORKSPACES\s*=\s*\([0-9]\+\)\s*$/\1/p' /etc/tiny-dfr/touchbar.conf | tail -1)
+    WORKSPACES=${WORKSPACES:-5}
+  fi
+  sudo install -Dm0664 -o root -g "$TARGET_USER" /dev/stdin /etc/tiny-dfr/touchbar.conf <<EOF
+# Per-machine Touch Bar settings. Read by both the shell plugin and the
 # fallback daemon, which must agree: the layout draws this many workspace
 # buttons and tiny-dfr-ws-icons paints exactly this many pills.
 WORKSPACES=$WORKSPACES
+# 1 only when /usr/local/bin/tiny-dfr carries patches/tiny-dfr-slider.patch.
+# Managed by install.sh; a stock tiny-dfr fed a Slider key silently drops the
+# whole layer.
+SLIDER=$SLIDER
 EOF
-  fi
-else
-  say "Keeping existing /etc/tiny-dfr/touchbar.conf"
 fi
 
 # The files the plugin generates at runtime. They are written IN PLACE (see the
@@ -163,9 +191,20 @@ done
 say "Installing systemd units"
 run sudo install -Dm0644 "$REPO/system/etc/systemd/system/tiny-dfr-workspace.service" \
   /etc/systemd/system/tiny-dfr-workspace.service
-for f in "$REPO"/system/etc/systemd/system/tiny-dfr.service.d/*.conf; do
-  run sudo install -Dm0644 "$f" "/etc/systemd/system/tiny-dfr.service.d/$(basename "$f")"
-done
+
+# Only with the patched binary: the drop-in that points the service at it, and
+# the one that lets it write the slider socket. Installing the first without the
+# binary would leave tiny-dfr.service failing to start on every other machine.
+DROPIN=/etc/systemd/system/tiny-dfr.service.d
+if (( SLIDER )); then
+  for f in "$REPO"/system/etc/systemd/system/tiny-dfr.service.d/*.conf; do
+    run sudo install -Dm0644 "$f" "$DROPIN/$(basename "$f")"
+  done
+else
+  for f in 99-local-build.conf slider.conf; do
+    [[ -e $DROPIN/$f ]] && run sudo rm -f "$DROPIN/$f"
+  done
+fi
 
 # /usr/lib, NOT /etc: systemd 261 compiles in a single system-sleep hook
 # directory and ignores /etc/systemd/system-sleep without a word of complaint.
@@ -215,6 +254,21 @@ say "Installing theme hook (repaints the workspace pills on theme change)"
 run install -Dm0755 "$REPO/system/theme-hook-tiny-dfr-ws-icons" \
   "$TARGET_HOME/.config/omarchy/hooks/theme-set.d/tiny-dfr-ws-icons"
 
+# The Touch Bar buttons only ever *send key combos*; these are the Hyprland
+# bindings those combos land on. Without them the AI button, the contextual
+# layers and the stepped level rows are all dead keys.
+say "Installing Hyprland bindings (hypr/touchbar.lua)"
+run install -Dm0644 "$REPO/hypr/touchbar.lua" "$TARGET_HOME/.config/hypr/touchbar.lua"
+HYPR_MAIN="$TARGET_HOME/.config/hypr/hyprland.lua"
+if [[ -f $HYPR_MAIN ]] && ! grep -q 'require("hypr.touchbar")' "$HYPR_MAIN"; then
+  if (( DRY )); then
+    printf '   would: append require("hypr.touchbar") to %s\n' "$HYPR_MAIN"
+  else
+    printf '\n-- Touch Bar bindings (omarchy-t2-touchbar); remove this line to drop them.\nrequire("hypr.touchbar")\n' >> "$HYPR_MAIN"
+    say "  appended require(\"hypr.touchbar\") to hyprland.lua"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # Activate
 # ---------------------------------------------------------------------------
@@ -246,51 +300,60 @@ if (( ! DRY )); then
   done
 fi
 
+# --no-redraw: nothing is driving the strip yet. Without it the script's
+# fallback would `systemctl restart` the daemon into life right before the
+# plugin is enabled, leaving two writers on config.toml.
 say "Generating the workspace pill icons for the current theme"
-run "$TARGET_HOME/.local/bin/tiny-dfr-ws-icons" || warn "pill generation failed (is Hyprland running?)"
+run "$TARGET_HOME/.local/bin/tiny-dfr-ws-icons" --no-redraw || warn "pill generation failed (is Hyprland running?)"
 
 say "Enabling units"
 run sudo systemctl enable --now tiny-dfr.service
-run systemctl --user enable --now tiny-dfr-slider.service
 run systemctl --user enable --now tiny-dfr-update-check.timer
+if (( SLIDER )); then
+  run systemctl --user enable --now tiny-dfr-slider.service
+else
+  systemctl --user is-enabled --quiet tiny-dfr-slider.service 2>/dev/null && \
+    run systemctl --user disable --now tiny-dfr-slider.service
+fi
+run sudo systemctl restart tiny-dfr.service
 
 # ---------------------------------------------------------------------------
-# Plugin
+# Who drives the strip: the plugin, or the standalone daemon. Never both --
+# they write the same file.
 # ---------------------------------------------------------------------------
 
-if (( WITH_PLUGIN )); then
+if (( WITH_PLUGIN )) && command -v omarchy-plugin-add >/dev/null; then
   say "Installing the Omarchy shell plugin"
-  if ! command -v omarchy-plugin-validate >/dev/null; then
-    warn "omarchy-shell not found; skipping the plugin half."
-    warn "Enable the standalone daemon instead:"
-    warn "  sudo systemctl enable --now tiny-dfr-workspace.service"
+  PLUGIN_DIR="$TARGET_HOME/.config/omarchy/plugins/$PLUGIN_ID"
+  # Through `omarchy plugin add`, so the plugin is a git checkout that
+  # `omarchy plugin update` can manage. Prefer this repo's own origin (a fresh
+  # clone from GitHub tracks upstream); fall back to the local checkout.
+  PLUGIN_URL=$(git -C "$REPO" remote get-url origin 2>/dev/null || true)
+  [[ -n $PLUGIN_URL ]] || PLUGIN_URL="file://$REPO"
+  if (( DRY )); then
+    printf '   would: omarchy plugin add %s --yes\n' "$PLUGIN_URL"
+  elif [[ -d $PLUGIN_DIR ]]; then
+    say "  already installed at $PLUGIN_DIR (update with: omarchy plugin update $PLUGIN_ID)"
   else
-    PLUGIN_DIR="$TARGET_HOME/.config/omarchy/plugins/t2.touchbar"
-    if (( DRY )); then
-      printf '   would: copy plugin -> %s\n' "$PLUGIN_DIR"
-    else
-      omarchy-plugin-validate "$REPO" || die "plugin failed validation"
-      mkdir -p "$PLUGIN_DIR"
-      # Only the files the shell loads. The system half and the tests have no
-      # business inside a directory the shell scans and hot-reloads.
-      cp -f "$REPO/manifest.json" "$REPO/Service.qml" "$REPO/BarWidget.qml" "$PLUGIN_DIR/"
-      mkdir -p "$PLUGIN_DIR/lib"
-      cp -f "$REPO/lib/TouchBar.js" "$PLUGIN_DIR/lib/"
+    omarchy-plugin-validate "$REPO" || die "plugin failed validation"
+    omarchy-plugin-add "$PLUGIN_URL" --yes || die "omarchy plugin add failed"
+  fi
 
-      omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-      say "Plugin installed. Enable it with:"
-      say "  omarchy plugin enable t2.touchbar"
-    fi
-    # The plugin and the daemon both write config.toml; running both means two
-    # writers racing on the same file and double the full-panel redraws.
-    if systemctl is-enabled --quiet tiny-dfr-workspace.service 2>/dev/null; then
-      warn "tiny-dfr-workspace.service is enabled and does the same job as the"
-      warn "plugin. Disable it once the plugin is confirmed working:"
-      warn "  sudo systemctl disable --now tiny-dfr-workspace.service"
+  say "Stopping the standalone daemon (the plugin does its job now)"
+  run sudo systemctl disable --now tiny-dfr-workspace.service
+
+  if (( ! DRY )); then
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    if omarchy-plugin-list --json 2>/dev/null | jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id and .enabled)' >/dev/null; then
+      omarchy-shell touchbar redraw >/dev/null 2>&1 || true
+      say "Plugin enabled and drawing."
+    else
+      say "Enable the plugin with:  omarchy plugin enable $PLUGIN_ID"
     fi
   fi
 else
-  say "Skipping the plugin; enabling the standalone daemon instead"
+  (( WITH_PLUGIN )) && warn "omarchy-shell not found; using the standalone daemon instead"
+  say "Enabling the standalone daemon"
   run sudo systemctl enable --now tiny-dfr-workspace.service
 fi
 

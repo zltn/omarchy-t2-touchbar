@@ -1,0 +1,1 @@
+3f666f90908696a1decee07a53a6db5028a4bc6b Make display backlight path optional to avoid panic on startup

@@ -39,6 +39,16 @@ sudo systemctl restart tiny-dfr
 which is passwordless via `/etc/sudoers.d/50-tiny-dfr`, and is what the bar
 widget's click does. A blank strip is a fair price for a machine that resumes.
 
+## Deep vs s2idle
+
+Omarchy's installer puts `mem_sleep_default=deep` on the T2 kernel command line.
+This hook was characterised under **s2idle** (this machine overrides Omarchy's
+default in `/etc/systemd/sleep.conf.d/`; see the companion `brcmfmac` hook in
+the same directory, which is what makes s2idle survive at all). The
+stop-before/start-after behaviour is the same under either, but the "comes back
+blank" rate has only been observed under s2idle. If you are on `deep`, expect
+different numbers, and please report them.
+
 ## The directory matters
 
 The hook installs to `/usr/lib/systemd/system-sleep/`, **not**

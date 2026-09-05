@@ -61,10 +61,21 @@ for f in \
   "$TARGET_HOME/.config/systemd/user/tiny-dfr-slider.service" \
   "$TARGET_HOME/.config/systemd/user/tiny-dfr-update-check.service" \
   "$TARGET_HOME/.config/systemd/user/tiny-dfr-update-check.timer" \
-  "$TARGET_HOME/.config/omarchy/hooks/theme-set.d/tiny-dfr-ws-icons"
+  "$TARGET_HOME/.config/omarchy/hooks/theme-set.d/tiny-dfr-ws-icons" \
+  "$TARGET_HOME/.config/hypr/touchbar.lua"
 do
   [[ -e $f ]] && run rm -f "$f"
 done
+
+HYPR_MAIN="$TARGET_HOME/.config/hypr/hyprland.lua"
+if [[ -f $HYPR_MAIN ]] && grep -q 'require("hypr.touchbar")' "$HYPR_MAIN"; then
+  say "Removing the require(\"hypr.touchbar\") line from hyprland.lua"
+  run sed -i '/^-- Touch Bar bindings (omarchy-t2-touchbar)/d; /^require("hypr.touchbar")$/d' "$HYPR_MAIN"
+fi
+
+# The patched binary is the user's build, not this repo's file, so it is left
+# alone -- but the service must stop pointing at it once the drop-in is gone.
+[[ -x /usr/local/bin/tiny-dfr ]] && say "Leaving /usr/local/bin/tiny-dfr in place (remove it yourself if unwanted)"
 
 if (( PURGE )); then
   say "Purging /etc/tiny-dfr"

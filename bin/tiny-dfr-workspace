@@ -69,6 +69,38 @@ def _workspace_count(default=5):
 
 WORKSPACES = tuple(range(1, _workspace_count() + 1))
 
+
+def _conf_flag(key, default=False):
+    """SLIDER=1 in touchbar.conf: the binary carries the slider patch."""
+    try:
+        with open(CONF) as f:
+            m = re.search(r"^\s*%s\s*=\s*([01])\s*$" % key, f.read(), re.M)
+    except Exception:
+        return default
+    return m.group(1) == "1" if m else default
+
+
+# Stock tiny-dfr has no Slider button type: a config containing one fails to
+# parse, and tiny-dfr silently falls back to its packaged layout -- so the
+# contextual layers would vanish with nothing in the journal. The templates
+# therefore carry @SLIDER:<name>@ and the renderer substitutes either the real
+# slider (patched binary) or a stepped row of absolute levels bound to
+# SUPER+CTRL+ALT+1..8 in hypr/touchbar.lua. Mirrored in lib/TouchBar.js.
+SLIDER = _conf_flag("SLIDER")
+_STEPPED_KEYS = {"volume": ("Num1", "Num2", "Num3", "Num4"),
+                 "brightness": ("Num5", "Num6", "Num7", "Num8")}
+
+
+def slider_row(name, enabled):
+    if enabled:
+        return f'    {{ Slider = "{name}", Stretch = 8 }},'
+    keys = _STEPPED_KEYS.get(name)
+    if not keys:
+        return ""
+    return "\n".join(
+        f'    {{ Text = "{lvl}", Action = [ "LeftMeta", "LeftCtrl", "LeftAlt", "{k}" ], Stretch = 2 }},'
+        for lvl, k in zip((25, 50, 75, 100), keys))
+
 # Bright enough to read at a glance on a black OLED strip at arm's length.
 BATT_GREEN = "#4ade80"
 BATT_AMBER = "#fbbf24"
@@ -203,7 +235,8 @@ def render(active, context=None):
         log(f"context template {path} unreadable ({e}), falling back")
         with open(TEMPLATE) as f:
             body = f.read()
-    return body.replace("@WORKSPACES@", "\n".join(rows))
+    body = body.replace("@WORKSPACES@", "\n".join(rows))
+    return re.sub(r"@SLIDER:(\w+)@", lambda m: slider_row(m.group(1), SLIDER), body)
 
 
 def write_config(active, context=None):

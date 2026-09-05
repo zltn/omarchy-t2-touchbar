@@ -67,18 +67,19 @@ def update_svg(available):
         os.unlink(tmp)
 
 
-def render_template(text, count, active):
+def render_template(text, count, active, slider=False):
     """Render `text` through the daemon's own render()."""
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
         f.write(text)
         tmp = f.name
-    old_ws, old_tpl = dfr.WORKSPACES, dfr.TEMPLATE
+    old_ws, old_tpl, old_sl = dfr.WORKSPACES, dfr.TEMPLATE, dfr.SLIDER
     try:
         dfr.WORKSPACES = tuple(range(1, count + 1))
         dfr.TEMPLATE = tmp
+        dfr.SLIDER = slider
         return dfr.render(active)
     finally:
-        dfr.WORKSPACES, dfr.TEMPLATE = old_ws, old_tpl
+        dfr.WORKSPACES, dfr.TEMPLATE, dfr.SLIDER = old_ws, old_tpl, old_sl
         os.unlink(tmp)
 
 
@@ -144,6 +145,17 @@ out = {
         "input": template_in,
         "out": render_template(template_in, 5, 3),
     },
+    # The context templates carry @SLIDER:name@; both settings must agree and
+    # neither may leave the token behind.
+    "contextTemplates": [
+        {"name": name, "slider": sl, "input": txt,
+         "out": render_template(txt, 5, 2, sl)}
+        for name, txt in (
+            (n, open(os.path.join(HERE, "..", "system", "etc", "tiny-dfr",
+                                  "context-%s.template.toml" % n)).read())
+            for n in ("audio", "display"))
+        for sl in (True, False)
+    ],
 }
 
 

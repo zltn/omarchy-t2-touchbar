@@ -23,7 +23,7 @@ MediaLayerKeys = [
 
     # Real slider: drag anywhere along it. tiny-dfr publishes the value to
     # /run/tiny-dfr/slider.sock and tiny-dfr-slider.service applies it.
-    { Slider = "volume", Stretch = 8 },
+@SLIDER:volume@
 
     { Stretch = 1 },
 

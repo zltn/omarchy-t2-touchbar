@@ -1,10 +1,15 @@
-# tiny-dfr layout TEMPLATE for this machine (MacBookPro15,4, T2).
+# tiny-dfr layout TEMPLATE. Rendered into config.toml by the t2.touchbar shell
+# plugin (or by tiny-dfr-workspace.service on machines without omarchy-shell)
+# every time the active Hyprland workspace or an indicator changes.
 #
-# DO NOT EDIT /etc/tiny-dfr/config.toml -- it is GENERATED from this file by
-# tiny-dfr-workspace.service every time the active Hyprland workspace changes.
-# Edit this template instead, then run:
-#   sudo systemctl restart tiny-dfr-workspace   (passwordless, see sudoers.d/50-tiny-dfr)
+# DO NOT EDIT /etc/tiny-dfr/config.toml -- it is generated from this file and
+# overwritten on the next change. Edit this template; it is watched, so saving
+# it is enough to redraw. A template that fails to parse is SILENTLY ignored and
+# tiny-dfr falls back to its packaged layout, so validate before saving:
+#   python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],"rb"))' config.template.toml
 #
+# The workspace marker below becomes one button per workspace (WORKSPACES= in
+# touchbar.conf).
 # The generated file is merged over /usr/share/tiny-dfr/config.toml, per-key,
 # with the generated copy winning.
 

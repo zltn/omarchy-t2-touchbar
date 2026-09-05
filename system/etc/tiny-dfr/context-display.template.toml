@@ -22,7 +22,7 @@ MediaLayerKeys = [
 
     # Real slider: drag anywhere along it. tiny-dfr publishes the value to
     # /run/tiny-dfr/slider.sock and tiny-dfr-slider.service applies it.
-    { Slider = "brightness", Stretch = 8 },
+@SLIDER:brightness@
 
     { Stretch = 1 },
 

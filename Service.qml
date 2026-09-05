@@ -41,6 +41,11 @@ Item {
   // /etc/tiny-dfr/touchbar.conf (WORKSPACES=...), read at startup.
   property int workspaceCount: 5
 
+  // Whether the running tiny-dfr carries the slider patch (SLIDER=1 in
+  // touchbar.conf). Decides what @SLIDER:name@ in a context template becomes;
+  // see sliderRow() in lib/TouchBar.js for why this cannot be left to chance.
+  property bool sliderEnabled: false
+
   // Which contextual layer is showing, or "" for the default layout. Every
   // Omarchy panel is the same Hyprland layer surface at identical geometry and
   // the shell does not expose which one is open, so the *trigger*
@@ -79,7 +84,8 @@ Item {
 
   function writeConfig() {
     if (root.activeWorkspace < 0) return
-    var text = TouchBar.renderConfig(templateText(), root.workspaceCount, root.activeWorkspace)
+    var text = TouchBar.renderConfig(templateText(), root.workspaceCount, root.activeWorkspace,
+                                     root.sliderEnabled)
     if (!text) return
     if (root.redrawNonce > 0) text += "\n# redraw " + root.redrawNonce + "\n"
     configFile.setText(text)
@@ -123,13 +129,18 @@ Item {
     onTriggered: root.applyPendingContext()
   }
 
-  property string pendingContext: ""
-  property bool hasPendingContext: false
+  // "open" or "close" -- WHICH context is resolved only when the settle timer
+  // fires, not when the event arrives. tiny-dfr-context writes context.state
+  // and then opens the panel, and contextStateFile picks that write up through
+  // an asynchronous reload; reading it at event time could still see the
+  // previous value. 150ms later it has landed.
+  property string pendingKind: ""
 
   function applyPendingContext() {
-    root.hasPendingContext = false
-    if (root.pendingContext === root.context) return
-    root.context = root.pendingContext
+    var target = root.pendingKind === "open" ? root.contextFromState : ""
+    root.pendingKind = ""
+    if (target === root.context) return
+    root.context = target
     if (root.context === "") {
       root.contextTemplate = ""
       root.writeConfig()
@@ -163,15 +174,12 @@ Item {
       if (String(event.data).trim() !== root.panelNamespace) return
 
       if (event.name === "openlayer") {
-        // The trigger already wrote context.state; contextStateFile is watching
-        // it, so just take the value it last saw.
-        root.pendingContext = root.contextFromState
+        root.pendingKind = "open"
       } else {
         // However the panel was dismissed, drop the layer.
         root.clearContextState()
-        root.pendingContext = ""
+        root.pendingKind = "close"
       }
-      root.hasPendingContext = true
       contextSettle.restart()
     }
   }
@@ -217,9 +225,14 @@ Item {
   function reportWriteFailure(path) {
     if (root.writeFailureReported) return
     root.writeFailureReported = true
-    console.warn("t2.touchbar: cannot write " + path + " -- the Touch Bar will " +
-      "not follow the workspace. It must be writable by this user; run " +
-      "install.sh, or: sudo chown root:$USER " + path + " && sudo chmod 0664 " + path)
+    // Which symptom depends on which file: config.toml means nothing on the
+    // strip updates at all; an SVG means only that one indicator is frozen.
+    var symptom = /config\.toml$/.test(path)
+      ? "the Touch Bar will not update at all"
+      : "that indicator will stay frozen on the strip"
+    console.warn("t2.touchbar: cannot write " + path + " -- " + symptom +
+      ". It must be writable by this user; re-run install.sh, or: " +
+      "sudo chown root:$USER " + path + " && sudo chmod 0664 " + path)
   }
 
   FileView {
@@ -229,7 +242,10 @@ Item {
     printErrors: false
     onLoaded: {
       root.defaultTemplate = text()
-      root.writeConfig()
+      // Through the debounce, not direct: at startup this, touchbar.conf and
+      // the first workspace all land within a few ms of each other, and three
+      // back-to-back writes would race tiny-dfr's IN_ONESHOT re-arm.
+      workspaceDebounce.restart()
     }
     onFileChanged: reload()
   }
@@ -407,7 +423,8 @@ Item {
         var n = parseInt(m[1], 10)
         if (n > 0 && n <= 10) root.workspaceCount = n
       }
-      root.writeConfig()
+      root.sliderEnabled = /^\s*SLIDER\s*=\s*1\s*$/m.test(text())
+      workspaceDebounce.restart()
     }
   }
 
@@ -429,6 +446,7 @@ Item {
         micMuted: root.micMuted,
         nightlight: root.nightOn,
         updatePending: root.updatePending,
+        slider: root.sliderEnabled,
         nonce: root.redrawNonce
       })
     }
