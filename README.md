@@ -28,17 +28,59 @@ cd omarchy-t2-touchbar
 ./install.sh
 ```
 
-That installs the system half, adds the plugin through `omarchy plugin add`
-(so `omarchy plugin update t2.touchbar` works later), and disables the
-standalone daemon. If the plugin was not enabled automatically:
+That installs the system half, adds and enables the plugin through
+`omarchy plugin add --enable` (so `omarchy plugin update t2.touchbar` works
+later), and disables the standalone daemon. It asks for your sudo password;
+nothing runs as root that is not listed in the dry run.
 
-```bash
-omarchy plugin enable t2.touchbar
-```
+**Manual steps — at most two, both at the end:**
+
+1. **Bindings.** Hyprland reloads its config when `hyprland.lua` is saved
+   (`misc:disable_autoreload` is off by default), so the new bindings are
+   usually live already. If `SUPER+CTRL+A` still opens the plain audio panel
+   without switching the strip, run `hyprctl reload`.
+2. **If the strip is blank** after the installer's final `systemctl restart
+   tiny-dfr`: `journalctl -u tiny-dfr -b 0` says why. The usual cause is the
+   USB device still in configuration 1 (see [Gotchas](#gotchas-worth-knowing));
+   a reboot applies the package's udev rule if the live switch did not take.
+
+Then check it is alive — see [Verify](#verify) below.
 
 `install.sh` is idempotent — re-run it after a `git pull`, and after
 `./build-tiny-dfr.sh`. `--no-plugin` installs the system half only and enables
 the standalone Python daemon instead, for a T2 Mac not running omarchy-shell.
+
+The plugin checkout tracks **wherever you cloned this repo from**: from GitHub,
+`omarchy plugin update t2.touchbar` pulls GitHub; from a local clone, it pulls
+that clone (so commit there first). A plugin dir that is not a git checkout —
+copied by hand, or left by an older version of this script — is replaced with
+a proper clone; its bar placement is kept, because that lives in `shell.json`.
+
+### Verify
+
+```bash
+omarchy-shell touchbar status            # JSON; "workspace" should follow SUPER+1..5
+journalctl _COMM=quickshell -b 0 | grep t2.touchbar   # must be empty
+ls -l /etc/tiny-dfr/config.toml          # -rw-rw-r-- root <you>
+```
+
+Switch workspaces: the pill on the strip should move within ~50 ms. Open the
+audio panel with `SUPER+CTRL+A`: the strip should switch to the audio layer and
+switch back when the panel closes. After your first suspend/resume, see
+[doc/SUSPEND.md](doc/SUSPEND.md) for the two journal checks that tell you
+whether the sleep hook ran.
+
+### Migrating from a hand-rolled setup
+
+If you set this up by hand before (following the notes this repo grew out of),
+two things collide with the installer:
+
+- **Bindings.** `hypr/touchbar.lua` contains the same `SUPER+CTRL+A/D/G` and
+  `SUPER+CTRL+ALT+1..8` bindings you may already have in `bindings.lua`. Remove
+  yours first — Hyprland runs duplicate binds twice, and a doubled `toggle`
+  opens the panel and closes it again.
+- **The daemon.** `install.sh` disables `tiny-dfr-workspace.service` when it
+  installs the plugin. That is intended; do not re-enable it alongside.
 
 ### Prerequisites
 
@@ -107,7 +149,7 @@ The daemon is still shipped, in `bin/`, for machines without omarchy-shell.
 requires byte-identical output, so the two cannot drift.
 
 ```bash
-node test/render-test.js
+node test/render-test.js   # exit status is the verdict; don't pipe it into tail
 ```
 
 ### Editing the layout
@@ -135,6 +177,16 @@ Hyprland binding. They live in [`hypr/touchbar.lua`](hypr/touchbar.lua), which
 rebinds `SUPER+CTRL+A` and `SUPER+CTRL+D` so the audio/display panels open
 *through* `tiny-dfr-context`, which is what lets the strip know a panel is open;
 the shell does not expose that over IPC.
+
+### The bar widget
+
+The plugin also puts a small keyboard glyph on the Omarchy bar (right section
+by default; move it with `omarchy bar move`). It dims when `tiny-dfr.service`
+is not running, and a click restarts the daemon — passwordless, via the
+sudoers rule `install.sh` writes. It exists because the strip cannot report
+its own death: a stopped daemon and a daemon drawing an all-black layout look
+identical from the Touch Bar. Most often needed after a resume; see
+[doc/SUSPEND.md](doc/SUSPEND.md).
 
 ### Settings
 

@@ -330,13 +330,27 @@ if (( WITH_PLUGIN )) && command -v omarchy-plugin-add >/dev/null; then
   # clone from GitHub tracks upstream); fall back to the local checkout.
   PLUGIN_URL=$(git -C "$REPO" remote get-url origin 2>/dev/null || true)
   [[ -n $PLUGIN_URL ]] || PLUGIN_URL="file://$REPO"
+  # A plugin dir that is not a git checkout (hand-copied, or left by an older
+  # version of this script) cannot be updated by `omarchy plugin update`;
+  # replace it with a proper clone. Enablement lives in shell.json, keyed by
+  # id, so the bar placement survives the swap.
+  if [[ -d $PLUGIN_DIR && ! -d $PLUGIN_DIR/.git ]]; then
+    say "  $PLUGIN_DIR is a loose copy, not a git checkout; replacing it"
+    run rm -rf "$PLUGIN_DIR"
+  fi
   if (( DRY )); then
-    printf '   would: omarchy plugin add %s --yes\n' "$PLUGIN_URL"
+    printf '   would: omarchy plugin add %s --enable --yes\n' "$PLUGIN_URL"
   elif [[ -d $PLUGIN_DIR ]]; then
-    say "  already installed at $PLUGIN_DIR (update with: omarchy plugin update $PLUGIN_ID)"
+    say "  already installed (git checkout). Update with: omarchy plugin update $PLUGIN_ID"
   else
     omarchy-plugin-validate "$REPO" || die "plugin failed validation"
-    omarchy-plugin-add "$PLUGIN_URL" --yes || die "omarchy plugin add failed"
+    # --enable --yes is non-interactive: no prompt, no placement question, the
+    # bar widget lands in its manifest defaultSection.
+    if ! omarchy-plugin-add "$PLUGIN_URL" --enable --yes; then
+      [[ -d $PLUGIN_DIR ]] || die "omarchy plugin add failed"
+      warn "plugin added but could not be enabled automatically; run:"
+      warn "  omarchy plugin enable $PLUGIN_ID"
+    fi
   fi
 
   say "Stopping the standalone daemon (the plugin does its job now)"
