@@ -70,7 +70,7 @@ done
 HYPR_MAIN="$TARGET_HOME/.config/hypr/hyprland.lua"
 if [[ -f $HYPR_MAIN ]] && grep -q 'require("hypr.touchbar")' "$HYPR_MAIN"; then
   say "Removing the require(\"hypr.touchbar\") line from hyprland.lua"
-  run sed -i '/^-- Touch Bar bindings (omarchy-io.github.zltn.t2-touchbar)/d; /^require("hypr.touchbar")$/d' "$HYPR_MAIN"
+  run sed -i '/^-- Touch Bar bindings (omarchy-t2-touchbar)/d; /^require("hypr.touchbar")$/d' "$HYPR_MAIN"
 fi
 
 # The patched binary is the user's build, not this repo's file, so it is left

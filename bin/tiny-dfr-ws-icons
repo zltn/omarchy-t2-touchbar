@@ -130,7 +130,7 @@ def main():
     # the config to trigger the reload.
     #
     # Which "something" depends on who is driving the strip. Under omarchy-shell
-    # that is the t2.touchbar plugin, and asking it to redraw is enough. Without
+    # that is the io.github.zltn.t2-touchbar plugin, and asking it to redraw is enough. Without
     # the shell it is tiny-dfr-workspace.service, which rewrites the config on
     # restart. Try the plugin first and fall back, so this one hook works for
     # both setups -- and so a theme change does not silently leave the pills in

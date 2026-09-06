@@ -1,4 +1,4 @@
-# tiny-dfr layout TEMPLATE. Rendered into config.toml by the t2.touchbar shell
+# tiny-dfr layout TEMPLATE. Rendered into config.toml by the io.github.zltn.t2-touchbar shell
 # plugin (or by tiny-dfr-workspace.service on machines without omarchy-shell)
 # every time the active Hyprland workspace or an indicator changes.
 #
