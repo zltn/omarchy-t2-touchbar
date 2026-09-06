@@ -34,7 +34,7 @@ reinstalling the package sticks. If the strip goes blank after an
 ## Install
 
 ```bash
-git clone https://github.com/<you>/omarchy-t2-touchbar
+git clone https://github.com/zltn/omarchy-t2-touchbar
 cd omarchy-t2-touchbar
 ./install.sh --dry-run   # shows what it will do
 ./install.sh
