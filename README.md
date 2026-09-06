@@ -1,4 +1,4 @@
-# omarchy-t2-touchbar
+# omarchy-io.github.zltn.t2-touchbar
 
 A working Touch Bar for T2 MacBooks on [Omarchy](https://omarchy.org).
 
@@ -34,8 +34,8 @@ reinstalling the package sticks. If the strip goes blank after an
 ## Install
 
 ```bash
-git clone https://github.com/zltn/omarchy-t2-touchbar
-cd omarchy-t2-touchbar
+git clone https://github.com/zltn/omarchy-io.github.zltn.t2-touchbar
+cd omarchy-io.github.zltn.t2-touchbar
 ./install.sh --dry-run   # shows what it will do
 ./install.sh
 ```
@@ -67,7 +67,7 @@ Usually nothing. Two things to check:
 
 ```bash
 omarchy-shell touchbar status                          # JSON with the current state
-journalctl _COMM=quickshell -b 0 | grep t2.touchbar    # should print nothing
+journalctl _COMM=quickshell -b 0 | grep io.github.zltn.t2-touchbar    # should print nothing
 ls -l /etc/tiny-dfr/config.toml                        # -rw-rw-r-- root <you>
 ```
 
@@ -172,7 +172,7 @@ Check the file permissions first:
 
 ```bash
 ls -l /etc/tiny-dfr/config.toml   # want -rw-rw-r-- root <you>
-journalctl _COMM=quickshell -b 0 | grep t2.touchbar
+journalctl _COMM=quickshell -b 0 | grep io.github.zltn.t2-touchbar
 ```
 
 The plugin runs as you and writes `config.toml` and the icon files in place.
@@ -268,7 +268,7 @@ Do not use `omarchy-refresh-shell` for this. It resets `shell.json` and
 removes your bar layout.
 
 The plugin is a git checkout of wherever you cloned this repo from.
-`omarchy plugin update t2.touchbar` pulls from there. If that is a local
+`omarchy plugin update io.github.zltn.t2-touchbar` pulls from there. If that is a local
 clone, commit your changes first.
 
 ## Uninstall

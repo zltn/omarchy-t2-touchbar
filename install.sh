@@ -20,7 +20,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY=0
 WITH_PLUGIN=1
 WORKSPACES="${WORKSPACES:-5}"
-PLUGIN_ID=t2.touchbar
+PLUGIN_ID=io.github.zltn.t2-touchbar
 
 while (( $# > 0 )); do
   case "$1" in

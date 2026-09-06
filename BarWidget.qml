@@ -18,7 +18,7 @@ import qs.Commons
 
 BarWidget {
   id: root
-  moduleName: "t2.touchbar"
+  moduleName: "io.github.zltn.t2-touchbar"
 
   // Nerd Font "keyboard" glyph, matching the weight of the bar's other icons.
   readonly property string glyph: ""

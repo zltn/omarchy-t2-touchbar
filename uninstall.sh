@@ -31,9 +31,9 @@ run sudo systemctl disable --now tiny-dfr-workspace.service
 
 say "Removing the shell plugin"
 if command -v omarchy-plugin-disable >/dev/null; then
-  run omarchy-plugin-disable t2.touchbar
+  run omarchy-plugin-disable io.github.zltn.t2-touchbar
 fi
-run rm -rf "$TARGET_HOME/.config/omarchy/plugins/t2.touchbar"
+run rm -rf "$TARGET_HOME/.config/omarchy/plugins/io.github.zltn.t2-touchbar"
 command -v omarchy-shell >/dev/null && run omarchy-shell shell rescanPlugins
 
 say "Removing system files"
@@ -70,7 +70,7 @@ done
 HYPR_MAIN="$TARGET_HOME/.config/hypr/hyprland.lua"
 if [[ -f $HYPR_MAIN ]] && grep -q 'require("hypr.touchbar")' "$HYPR_MAIN"; then
   say "Removing the require(\"hypr.touchbar\") line from hyprland.lua"
-  run sed -i '/^-- Touch Bar bindings (omarchy-t2-touchbar)/d; /^require("hypr.touchbar")$/d' "$HYPR_MAIN"
+  run sed -i '/^-- Touch Bar bindings (omarchy-io.github.zltn.t2-touchbar)/d; /^require("hypr.touchbar")$/d' "$HYPR_MAIN"
 fi
 
 # The patched binary is the user's build, not this repo's file, so it is left

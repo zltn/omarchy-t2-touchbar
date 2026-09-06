@@ -230,7 +230,7 @@ Item {
     var symptom = /config\.toml$/.test(path)
       ? "the Touch Bar will not update at all"
       : "that indicator will stay frozen on the strip"
-    console.warn("t2.touchbar: cannot write " + path + " -- " + symptom +
+    console.warn("io.github.zltn.t2-touchbar: cannot write " + path + " -- " + symptom +
       ". It must be writable by this user; re-run install.sh, or: " +
       "sudo chown root:$USER " + path + " && sudo chmod 0664 " + path)
   }
